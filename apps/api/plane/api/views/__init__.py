@@ -84,3 +84,8 @@ from .service_account import (
 from .sticky import StickyViewSet
 
 from .webhook import WebhookAPIEndpoint, WebhookDetailAPIEndpoint
+
+from .workspace import (
+    WorkspaceListCreateAPIEndpoint,
+    WorkspaceDetailAPIEndpoint,
+)

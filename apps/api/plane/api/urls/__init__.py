@@ -16,8 +16,13 @@ from .work_item import urlpatterns as work_item_patterns
 from .invite import urlpatterns as invite_patterns
 from .sticky import urlpatterns as sticky_patterns
 from .webhook import urlpatterns as webhook_patterns
+from .workspace import urlpatterns as workspace_patterns
 
 urlpatterns = [
+    # Workspace patterns come first: the invite and sticky DefaultRouters mount
+    # an API-root view at ``workspaces/<slug>/``, so the workspace detail route
+    # must be registered ahead of them to take precedence for that exact path.
+    *workspace_patterns,
     *asset_patterns,
     *cycle_patterns,
     *intake_patterns,
