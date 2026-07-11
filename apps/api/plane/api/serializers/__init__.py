@@ -70,3 +70,4 @@ from .member import (
     ProjectMemberLiteAPISerializer,
 )
 from .sticky import StickySerializer
+from .webhook import WebhookSerializer
