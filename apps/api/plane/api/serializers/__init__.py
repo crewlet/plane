@@ -79,4 +79,4 @@ from .service_account import (
 )
 from .sticky import StickySerializer
 from .webhook import WebhookSerializer, WebhookLiteSerializer
-from .page import PageSerializer
+from .page import PageSerializer, PageAPISerializer

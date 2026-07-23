@@ -89,3 +89,10 @@ from .workspace import (
     WorkspaceListCreateAPIEndpoint,
     WorkspaceDetailAPIEndpoint,
 )
+
+from .page import (
+    PageListCreateAPIEndpoint,
+    PageDetailAPIEndpoint,
+    PageArchiveAPIEndpoint,
+    PageLockAPIEndpoint,
+)
