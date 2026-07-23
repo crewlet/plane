@@ -8,6 +8,7 @@ from .intake import urlpatterns as intake_patterns
 from .label import urlpatterns as label_patterns
 from .member import urlpatterns as member_patterns
 from .module import urlpatterns as module_patterns
+from .page import urlpatterns as page_patterns
 from .project import urlpatterns as project_patterns
 from .service_account import urlpatterns as service_account_patterns
 from .state import urlpatterns as state_patterns

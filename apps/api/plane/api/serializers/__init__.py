@@ -63,6 +63,7 @@ from .asset import (
     GenericAssetUpdateSerializer,
     FileAssetSerializer,
 )
+from .page import PageSearchSerializer
 from .invite import WorkspaceInviteSerializer
 from .member import (
     ProjectMemberSerializer,

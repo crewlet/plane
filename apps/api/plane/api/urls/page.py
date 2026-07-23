@@ -9,6 +9,7 @@ from plane.api.views.page import (
     PageDetailAPIEndpoint,
     PageArchiveAPIEndpoint,
     PageLockAPIEndpoint,
+    PageSearchEndpoint,
 )
 
 urlpatterns = [
@@ -31,5 +32,10 @@ urlpatterns = [
         "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/lock/",
         PageLockAPIEndpoint.as_view(http_method_names=["post", "delete"]),
         name="page-lock",
+    ),
+    path(
+        "workspaces/<str:slug>/pages/search/",
+        PageSearchEndpoint.as_view(http_method_names=["get"]),
+        name="page-search",
     ),
 ]
