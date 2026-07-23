@@ -17,6 +17,11 @@ class PageSerializer(BaseSerializer):
     Read-only projection of a :class:`~plane.db.models.Page`. ``description_binary``
     is intentionally excluded — it is a ``BinaryField`` (the Yjs document) that has
     no JSON representation and is not part of the public webhook contract.
+
+    Kept distinct from :class:`PageAPISerializer`: the webhook contract reports the
+    stored row to an external subscriber, so it carries fields the REST surface
+    omits (``workspace``, ``is_global``, ``description_stripped``) and applies none
+    of the request-scoped visibility filtering the API serializer does.
     """
 
     class Meta:
@@ -47,20 +52,32 @@ class PageSerializer(BaseSerializer):
 
 
 class PageAPISerializer(BaseSerializer):
-    """Read/write serializer for pages in the public token (v1) API.
-
-    Third-party integrations exchange page content as ``description_html``,
-    sanitized on write with the same ``validate_html_content`` sanitizer the
-    internal API uses. The Yjs ``description_binary`` / ``description_json``
-    fields are intentionally excluded from the public contract — they are the
-    live-collaboration document state and have no stable JSON representation.
-
-    ``parent`` is writable, and DRF resolves relations through the model's default
-    manager, which knows nothing about who is asking. It is therefore validated
-    against the caller's access-scoped queryset by
-    ``PageAPIEndpoint._invalid_parent_response`` — the single place that owns page
-    visibility — before any save. Any new page write path must call it too.
     """
+    Serializer for pages in the public v1 API.
+
+    Exposes page metadata alongside the sanitized ``description_html`` content
+    used to exchange page bodies over the token API. The collaborative-editing
+    state (``description_binary``/``description_json``/``description_stripped``)
+    is owned by the live (Yjs) service and is deliberately kept out of this
+    serializer so it never crosses the public contract — clients read and write
+    HTML only.
+    """
+
+    def validate_description_html(self, value):
+        """
+        Sanitize incoming page HTML with the same sanitizer the internal app
+        API uses (``validate_html_content`` -> ``nh3``) so API-authored content
+        is held to the identical safety bar as UI-authored content.
+        """
+        if not value:
+            return value
+
+        is_valid, error_message, sanitized_html = validate_html_content(value)
+        if not is_valid:
+            raise serializers.ValidationError(error_message)
+
+        # Return sanitized HTML if available, otherwise return original
+        return sanitized_html if sanitized_html is not None else value
 
     class Meta:
         model = Page
@@ -94,19 +111,3 @@ class PageAPISerializer(BaseSerializer):
             "created_by",
             "updated_by",
         ]
-
-    def validate_description_html(self, value):
-        """Sanitize page HTML with the same sanitizer the internal API uses.
-
-        Mirrors ``PageBinaryUpdateSerializer.validate_description_html`` so
-        API-authored content is held to the identical nh3 allow-list.
-        """
-        if not value:
-            return value
-
-        is_valid, error_message, sanitized_html = validate_html_content(value)
-        if not is_valid:
-            raise serializers.ValidationError(error_message)
-
-        # Return sanitized HTML if available, otherwise return original
-        return sanitized_html if sanitized_html is not None else value
