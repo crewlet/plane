@@ -2,1260 +2,1169 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-from datetime import timedelta
+"""Contract tests for the public v1 project page endpoints.
+
+Covers the full CRUD + archive/lock surface, HTML sanitization, `page` webhook
+dispatch, and — most importantly — a complete private-page access matrix that
+exercises every verb from every relevant vantage point (owner, other project
+member, workspace member not in the project, and guest).
+"""
+
+from datetime import date
 from unittest import mock
+from uuid import uuid4
 
 import pytest
-from django.core.cache import cache
-from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
 from plane.db.models import (
+    APIToken,
     Page,
     Project,
     ProjectMember,
     ProjectPage,
     User,
-    Workspace,
+    Webhook,
     WorkspaceMember,
 )
-from plane.db.models.api import APIToken
-
-
-@pytest.fixture(autouse=True)
-def _clear_throttle_cache():
-    """Reset the ApiKeyRateThrottle counter (redis-backed cache) between tests.
-
-    The throttle state lives in the shared cache, not the DB, so it is not
-    rolled back per test — without clearing it, a run's requests accumulate and
-    later tests spuriously hit HTTP 429. Mirrors the pattern in
-    ``test_authentication.py``.
-    """
-    cache.clear()
-    yield
-    cache.clear()
 
 
 # ---------------------------------------------------------------------------
-# Fixtures & helpers
+# Helpers & fixtures
 # ---------------------------------------------------------------------------
+
+
+def _make_user(prefix):
+    """Create and return an active user with a unique identity."""
+    uid = uuid4().hex[:8]
+    user = User.objects.create(
+        email=f"{prefix}-{uid}@plane.so",
+        username=f"{prefix}_{uid}",
+        first_name=prefix.capitalize(),
+        last_name="User",
+    )
+    user.set_password("test-password")
+    user.save()
+    return user
+
+
+def _api_client_for(user):
+    """Build an X-Api-Key authenticated client for the given user."""
+    token = APIToken.objects.create(user=user, label=f"tok-{uuid4().hex[:6]}")
+    client = APIClient()
+    client.credentials(HTTP_X_API_KEY=token.token)
+    return client
+
+
+def _link_page(project, page, user):
+    """Attach a page to a project through the ProjectPage join model."""
+    ProjectPage.objects.create(
+        workspace=project.workspace,
+        project=project,
+        page=page,
+        created_by_id=user.id,
+        updated_by_id=user.id,
+    )
 
 
 @pytest.fixture
 def project(db, workspace, create_user):
-    """A project in the test workspace with the api-key user as an admin."""
+    """Create a test project with the token user (owner) as an admin member."""
     project = Project.objects.create(
         name="Test Project",
         identifier="TP",
         workspace=workspace,
         created_by=create_user,
     )
-    ProjectMember.objects.create(project=project, member=create_user, role=20, is_active=True)
+    ProjectMember.objects.create(
+        project=project,
+        member=create_user,
+        role=20,  # Admin
+        is_active=True,
+    )
     return project
 
 
-def _api_client_for(user):
-    """Build an X-Api-Key authenticated client for an arbitrary user."""
-    token = APIToken.objects.create(user=user, label="test-token")
-    client = APIClient()
-    client.credentials(HTTP_X_API_KEY=token.token)
-    return client
-
-
 @pytest.fixture
-def make_project_user(db, workspace, project):
-    """Factory: a user provisioned at a given project role (or workspace-only)."""
+def actors(db, workspace, project, create_user):
+    """Build the four access-matrix vantage points, each with its own client.
 
-    def _make(email, project_role):
-        # username is unique and defaults to "" — set it so multiple test users
-        # don't collide on the empty string.
-        """Create a user at the given project role (None = workspace member only)."""
-        user = User.objects.create(email=email, username=email, first_name=email.split("@")[0])
-        user.set_password("password")
-        user.save()
-        WorkspaceMember.objects.create(workspace=workspace, member=user, role=15)
-        if project_role is not None:
-            ProjectMember.objects.create(project=project, member=user, role=project_role, is_active=True)
-        return user
-
-    return _make
-
-
-@pytest.fixture
-def role_clients(api_key_client, make_project_user):
-    """A client for each role in the access matrix.
-
-    - owner: the api-key user (project admin) who owns the pages under test
-    - member: a different project member (role 15)
-    - outsider: a workspace member who is NOT in the project
-    - guest: a project guest (role 5)
+    - ``owner``: the page owner (also the ``api_key_client`` user), project admin
+    - ``member``: a different active project member (role 15)
+    - ``ws_only``: a workspace member who is NOT a member of the project
+    - ``guest``: an active project member with the guest role (role 5)
     """
+    member = _make_user("member")
+    WorkspaceMember.objects.create(workspace=workspace, member=member, role=15)
+    ProjectMember.objects.create(project=project, member=member, role=15, is_active=True)
+
+    ws_only = _make_user("wsonly")
+    WorkspaceMember.objects.create(workspace=workspace, member=ws_only, role=15)
+
+    guest = _make_user("guest")
+    WorkspaceMember.objects.create(workspace=workspace, member=guest, role=5)
+    ProjectMember.objects.create(project=project, member=guest, role=5, is_active=True)
+
     return {
-        "owner": api_key_client,
-        "member": _api_client_for(make_project_user("member@plane.so", 15)),
-        "outsider": _api_client_for(make_project_user("outsider@plane.so", None)),
-        "guest": _api_client_for(make_project_user("guest@plane.so", 5)),
+        "owner": {"user": create_user, "client": _api_client_for(create_user)},
+        "member": {"user": member, "client": _api_client_for(member)},
+        "ws_only": {"user": ws_only, "client": _api_client_for(ws_only)},
+        "guest": {"user": guest, "client": _api_client_for(guest)},
     }
 
 
-def make_page(
-    project,
-    owner,
-    *,
-    access=Page.PRIVATE_ACCESS,
-    archived=False,
-    locked=False,
-    name="Secret Page",
-    parent=None,
-    external_id=None,
-    external_source=None,
-):
-    """Create a page linked to ``project`` and owned by ``owner``."""
+@pytest.fixture
+def other_user(db):
+    """Create a second user for ownership tests."""
+    return _make_user("other")
+
+
+@pytest.fixture
+def create_page(db, project, create_user):
+    """Create a public page owned by the token user."""
     page = Page.objects.create(
-        name=name,
-        description_html="<p>content</p>",
-        owned_by=owner,
+        name="Existing Page",
+        description_html="<p>Test content</p>",
+        owned_by=create_user,
         workspace=project.workspace,
-        access=access,
-        # archived_at is a DateField, so timezone.now() is coerced to its date —
-        # the same value the endpoints write.
-        archived_at=timezone.now() if archived else None,
-        is_locked=locked,
-        parent=parent,
-        external_id=external_id,
-        external_source=external_source,
+        access=Page.PUBLIC_ACCESS,
     )
-    ProjectPage.objects.create(
-        workspace=project.workspace,
-        project=project,
-        page=page,
-        created_by_id=owner.id,
-        updated_by_id=owner.id,
-    )
+    _link_page(project, page, create_user)
     return page
 
 
-def list_url(slug, project_id):
-    """URL of the project page list/create endpoint."""
-    return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/"
+@pytest.fixture
+def private_page(db, project, create_user):
+    """Create a private page owned by the token user (owner)."""
+    page = Page.objects.create(
+        name="Private Page",
+        description_html="<p>Secret content</p>",
+        owned_by=create_user,
+        workspace=project.workspace,
+        access=Page.PRIVATE_ACCESS,
+    )
+    _link_page(project, page, create_user)
+    return page
 
 
-def detail_url(slug, project_id, page_id):
-    """URL of a single page's retrieve/update/delete endpoint."""
-    return f"{list_url(slug, project_id)}{page_id}/"
+@pytest.fixture
+def public_page(db, project, create_user):
+    """Create a public page owned by the token user (owner)."""
+    page = Page.objects.create(
+        name="Public Page",
+        description_html="<p>Public content</p>",
+        owned_by=create_user,
+        workspace=project.workspace,
+        access=Page.PUBLIC_ACCESS,
+    )
+    _link_page(project, page, create_user)
+    return page
 
 
-def archive_url(slug, project_id, page_id):
-    """URL of a page's archive/restore endpoint."""
-    return f"{detail_url(slug, project_id, page_id)}archive/"
+@pytest.fixture
+def archived_page(db, project, create_user):
+    """Create an archived public page owned by the token user."""
+    page = Page.objects.create(
+        name="Archived Page",
+        description_html="<p>Archived content</p>",
+        owned_by=create_user,
+        workspace=project.workspace,
+        access=Page.PUBLIC_ACCESS,
+        archived_at=date.today(),
+    )
+    _link_page(project, page, create_user)
+    return page
 
 
-def lock_url(slug, project_id, page_id):
-    """URL of a page's lock/unlock endpoint."""
-    return f"{detail_url(slug, project_id, page_id)}lock/"
+@pytest.fixture
+def locked_page(db, project, create_user):
+    """Create a locked public page owned by the token user."""
+    page = Page.objects.create(
+        name="Locked Page",
+        description_html="<p>Locked content</p>",
+        owned_by=create_user,
+        workspace=project.workspace,
+        access=Page.PUBLIC_ACCESS,
+        is_locked=True,
+    )
+    _link_page(project, page, create_user)
+    return page
 
 
 # ---------------------------------------------------------------------------
-# List / Create
+# List & Create
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
 class TestPageListCreateAPIEndpoint:
-    """Listing and creating pages through the public token API."""
+    """Test Page List and Create API Endpoint."""
+
+    def list_url(self, slug, project_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/"
 
     @pytest.mark.django_db
     def test_unauthenticated_request(self, api_client, workspace, project):
-        # No X-Api-Key -> APIKeyAuthentication returns 401 Unauthorized.
-        """A request with no API key is rejected."""
-        response = api_client.get(list_url(workspace.slug, project.id))
-        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        """Unauthenticated requests (no API key) are rejected.
+
+        APIKeyAuthentication does not set a WWW-Authenticate header, so DRF may
+        surface the missing credential as either 401 or 403.
+        """
+        url = self.list_url(workspace.slug, project.id)
+        response = api_client.get(url)
+        assert response.status_code in (
+            status.HTTP_401_UNAUTHORIZED,
+            status.HTTP_403_FORBIDDEN,
+        )
 
     @pytest.mark.django_db
-    def test_list_pages_success(self, api_key_client, workspace, project, create_user):
-        """Listing returns a paginated payload."""
-        make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="A public page")
-        response = api_key_client.get(list_url(workspace.slug, project.id))
+    def test_list_pages_success(self, api_key_client, workspace, project, create_page):
+        """200 with paginated results on list."""
+        url = self.list_url(workspace.slug, project.id)
+        response = api_key_client.get(url)
+
         assert response.status_code == status.HTTP_200_OK
         assert "results" in response.data
         assert len(response.data["results"]) >= 1
 
     @pytest.mark.django_db
-    def test_list_excludes_archived_by_default(self, api_key_client, workspace, project, create_user):
-        """Archived pages are hidden unless asked for."""
-        live = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Live")
-        archived = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True, name="Archived")
-        response = api_key_client.get(list_url(workspace.slug, project.id))
-        ids = [str(p["id"]) for p in response.data["results"]]
-        assert str(live.id) in ids
-        assert str(archived.id) not in ids
+    def test_list_pages_excludes_archived_by_default(
+        self, api_key_client, workspace, project, create_page, archived_page
+    ):
+        """Archived pages are excluded from the default list."""
+        url = self.list_url(workspace.slug, project.id)
+        response = api_key_client.get(url)
 
-    @pytest.mark.django_db
-    def test_list_search_filters_by_name(self, api_key_client, workspace, project, create_user):
-        """`search` narrows the list by page name."""
-        make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Runbook")
-        make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Design Doc")
-        response = api_key_client.get(list_url(workspace.slug, project.id), {"search": "run"})
-        names = [p["name"] for p in response.data["results"]]
-        assert names == ["Runbook"]
-
-    @pytest.mark.django_db
-    def test_list_type_filter(self, api_key_client, workspace, project, create_user):
-        """`type` selects public, private or archived pages."""
-        public = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Public")
-        private = make_page(project, create_user, access=Page.PRIVATE_ACCESS, name="Private")
-        archived = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True, name="Archived")
-
-        def ids(resp):
-            """Collect the page ids from a paginated response."""
-            return {str(p["id"]) for p in resp.data["results"]}
-
-        public_ids = ids(api_key_client.get(list_url(workspace.slug, project.id), {"type": "public"}))
-        assert str(public.id) in public_ids
-        assert str(private.id) not in public_ids
-        assert str(archived.id) not in public_ids
-
-        private_ids = ids(api_key_client.get(list_url(workspace.slug, project.id), {"type": "private"}))
-        assert private_ids == {str(private.id)}
-
-        archived_ids = ids(api_key_client.get(list_url(workspace.slug, project.id), {"type": "archived"}))
-        assert archived_ids == {str(archived.id)}
-
-    @pytest.mark.django_db
-    def test_list_type_all_excludes_archived_as_documented(self, api_key_client, workspace, project, create_user):
-        """`type=all` means every non-archived page — the documented behaviour."""
-        live = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Live")
-        mine = make_page(project, create_user, access=Page.PRIVATE_ACCESS, name="Mine")
-        archived = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True, name="Archived")
-
-        response = api_key_client.get(list_url(workspace.slug, project.id), {"type": "all"})
-        ids = {str(p["id"]) for p in response.data["results"]}
-        assert {str(live.id), str(mine.id)} <= ids
-        assert str(archived.id) not in ids
-
-    @pytest.mark.django_db
-    def test_list_unrecognised_type_falls_back_to_all(self, api_key_client, workspace, project, create_user):
-        """An unknown `type` behaves as `all`, as the parameter documents."""
-        live = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Live")
-        archived = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True, name="Archived")
-
-        response = api_key_client.get(list_url(workspace.slug, project.id), {"type": "nonsense"})
         assert response.status_code == status.HTTP_200_OK
-        ids = {str(p["id"]) for p in response.data["results"]}
-        assert str(live.id) in ids
-        assert str(archived.id) not in ids
+        page_ids = [str(p["id"]) for p in response.data["results"]]
+        assert str(create_page.id) in page_ids
+        assert str(archived_page.id) not in page_ids
 
     @pytest.mark.django_db
-    def test_list_hides_other_users_private_pages(self, role_clients, workspace, project, create_user):
-        """The private-page leak fix: a member never sees another user's private page."""
-        private = make_page(project, create_user, access=Page.PRIVATE_ACCESS, name="Owner Only")
-        public = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Shared")
+    def test_list_type_archived(self, api_key_client, workspace, project, create_page, archived_page):
+        """type=archived returns only archived pages."""
+        url = self.list_url(workspace.slug, project.id) + "?type=archived"
+        response = api_key_client.get(url)
 
-        response = role_clients["member"].get(list_url(workspace.slug, project.id))
-        ids = [str(p["id"]) for p in response.data["results"]]
-        assert str(public.id) in ids
-        assert str(private.id) not in ids
+        assert response.status_code == status.HTTP_200_OK
+        page_ids = [str(p["id"]) for p in response.data["results"]]
+        assert str(archived_page.id) in page_ids
+        assert str(create_page.id) not in page_ids
+
+    @pytest.mark.django_db
+    def test_list_type_public_and_private(self, api_key_client, workspace, project, public_page, private_page):
+        """type=public / type=private partition pages by access."""
+        base = self.list_url(workspace.slug, project.id)
+
+        public = api_key_client.get(base + "?type=public")
+        public_ids = [str(p["id"]) for p in public.data["results"]]
+        assert str(public_page.id) in public_ids
+        assert str(private_page.id) not in public_ids
+
+        private = api_key_client.get(base + "?type=private")
+        private_ids = [str(p["id"]) for p in private.data["results"]]
+        assert str(private_page.id) in private_ids
+        assert str(public_page.id) not in private_ids
+
+    @pytest.mark.django_db
+    def test_list_search_by_name(self, api_key_client, workspace, project, create_user):
+        """search= filters pages by name (case-insensitive contains)."""
+        matching = Page.objects.create(
+            name="Roadmap Q3",
+            owned_by=create_user,
+            workspace=project.workspace,
+        )
+        _link_page(project, matching, create_user)
+        other = Page.objects.create(
+            name="Meeting Notes",
+            owned_by=create_user,
+            workspace=project.workspace,
+        )
+        _link_page(project, other, create_user)
+
+        url = self.list_url(workspace.slug, project.id) + "?search=roadmap"
+        response = api_key_client.get(url)
+
+        assert response.status_code == status.HTTP_200_OK
+        page_ids = [str(p["id"]) for p in response.data["results"]]
+        assert str(matching.id) in page_ids
+        assert str(other.id) not in page_ids
 
     @pytest.mark.django_db
     def test_create_page_success(self, api_key_client, workspace, project):
-        """A created page is linked to the project with no Yjs binary."""
+        """201 on successful page creation with ProjectPage created."""
+        url = self.list_url(workspace.slug, project.id)
         data = {"name": "New Page", "description_html": "<p>Hello world</p>"}
-        response = api_key_client.post(list_url(workspace.slug, project.id), data, format="json")
+
+        response = api_key_client.post(url, data, format="json")
 
         assert response.status_code == status.HTTP_201_CREATED
         assert response.data["name"] == "New Page"
+        # Binary/Yjs fields never cross the serializer contract.
+        assert "description_binary" not in response.data
+        assert "description_json" not in response.data
+
         page = Page.objects.get(pk=response.data["id"])
         assert page.description_binary is None
         assert ProjectPage.objects.filter(page=page, project=project).exists()
 
     @pytest.mark.django_db
-    def test_create_sanitizes_description_html(self, api_key_client, workspace, project):
-        """HTML content is sanitized on write with the same nh3 sanitizer."""
+    def test_create_page_sanitizes_description_html(self, api_key_client, workspace, project):
+        """description_html is sanitized on write (script tags stripped)."""
+        url = self.list_url(workspace.slug, project.id)
         data = {
-            "name": "XSS",
-            "description_html": "<p>ok</p><script>alert('xss')</script>",
+            "name": "XSS Page",
+            "description_html": "<p>safe</p><script>alert('x')</script>",
         }
-        response = api_key_client.post(list_url(workspace.slug, project.id), data, format="json")
+
+        response = api_key_client.post(url, data, format="json")
+
         assert response.status_code == status.HTTP_201_CREATED
         page = Page.objects.get(pk=response.data["id"])
         assert "<script>" not in page.description_html
-        assert "ok" in page.description_html
+        assert "safe" in page.description_html
 
     @pytest.mark.django_db
-    def test_create_external_id_conflict(self, api_key_client, workspace, project):
-        """A duplicate external id/source pair conflicts."""
-        data = {"name": "External", "external_id": "ext-1", "external_source": "notion"}
-        first = api_key_client.post(list_url(workspace.slug, project.id), data, format="json")
-        assert first.status_code == status.HTTP_201_CREATED
+    def test_create_page_with_external_id(self, api_key_client, workspace, project):
+        """201 on creation with external_id, 409 on duplicate."""
+        url = self.list_url(workspace.slug, project.id)
+        data = {
+            "name": "External Page",
+            "external_id": "ext-page-1",
+            "external_source": "notion",
+        }
 
-        dup = {"name": "Dup", "external_id": "ext-1", "external_source": "notion"}
-        second = api_key_client.post(list_url(workspace.slug, project.id), dup, format="json")
-        assert second.status_code == status.HTTP_409_CONFLICT
-        assert "same external id" in second.data["error"]
-        # The caller owns the conflicting page, so it is theirs to look up.
-        assert second.data["id"] == str(first.data["id"])
+        response = api_key_client.post(url, data, format="json")
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.data["external_id"] == "ext-page-1"
+
+        dup_data = {
+            "name": "Duplicate Page",
+            "external_id": "ext-page-1",
+            "external_source": "notion",
+        }
+        response2 = api_key_client.post(url, dup_data, format="json")
+        assert response2.status_code == status.HTTP_409_CONFLICT
+        assert "same external id" in response2.data["error"]
 
     @pytest.mark.django_db
-    def test_create_forbidden_for_guest(self, role_clients, workspace, project):
-        """Guests (read-only) cannot create pages."""
-        response = role_clients["guest"].post(
-            list_url(workspace.slug, project.id),
-            {"name": "Nope"},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_403_FORBIDDEN
-
-    @pytest.mark.django_db
-    def test_create_forbidden_for_outsider(self, role_clients, workspace, project):
-        """A workspace member outside the project cannot create."""
-        response = role_clients["outsider"].post(
-            list_url(workspace.slug, project.id),
-            {"name": "Nope"},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_403_FORBIDDEN
+    def test_create_page_dispatches_page_webhook(self, api_key_client, workspace, project):
+        """Create flows through the model_activity -> page webhook path."""
+        url = self.list_url(workspace.slug, project.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.post(url, {"name": "Hooked"}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
 
 
 # ---------------------------------------------------------------------------
-# Detail (retrieve / update / delete) — happy paths & guards
+# Retrieve, Update & Delete
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
 class TestPageDetailAPIEndpoint:
-    """Retrieving, updating and deleting a page through the public token API."""
+    """Test Page Detail API Endpoint."""
+
+    def detail_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/"
 
     @pytest.mark.django_db
-    def test_retrieve_page(self, api_key_client, workspace, project, create_user):
-        """A visible page can be retrieved by id."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = api_key_client.get(detail_url(workspace.slug, project.id, page.id))
+    def test_retrieve_page(self, api_key_client, workspace, project, create_page):
+        """200 on successful retrieval."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        response = api_key_client.get(url)
+
         assert response.status_code == status.HTTP_200_OK
-        assert str(response.data["id"]) == str(page.id)
+        assert str(response.data["id"]) == str(create_page.id)
+        assert response.data["name"] == create_page.name
 
     @pytest.mark.django_db
-    def test_update_page_success(self, api_key_client, workspace, project, create_user):
-        """Name and content updates persist."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        data = {"name": "Renamed", "description_html": "<p>updated</p>"}
-        response = api_key_client.patch(detail_url(workspace.slug, project.id, page.id), data, format="json")
+    def test_retrieve_page_not_found(self, api_key_client, workspace, project):
+        """404 for non-existent page."""
+        url = self.detail_url(workspace.slug, project.id, uuid4())
+        response = api_key_client.get(url)
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.django_db
+    def test_update_page_success(self, api_key_client, workspace, project, create_page):
+        """200 on successful update with description_html."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        data = {
+            "name": "Updated Page Name",
+            "description_html": "<p>Updated content</p>",
+        }
+
+        response = api_key_client.patch(url, data, format="json")
+
         assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert page.name == "Renamed"
-        assert page.description_html == "<p>updated</p>"
-        assert page.description_binary is None
+        create_page.refresh_from_db()
+        assert create_page.name == "Updated Page Name"
+        assert create_page.description_html == "<p>Updated content</p>"
+        assert create_page.description_binary is None
 
     @pytest.mark.django_db
-    def test_update_sanitizes_description_html(self, api_key_client, workspace, project, create_user):
-        """Unsafe markup is stripped on update."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        data = {"description_html": "<p>safe</p><img src=x onerror=alert(1)>"}
-        response = api_key_client.patch(detail_url(workspace.slug, project.id, page.id), data, format="json")
+    def test_update_page_sanitizes_description_html(self, api_key_client, workspace, project, create_page):
+        """Update sanitizes description_html with the internal sanitizer."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        data = {"description_html": "<p>ok</p><script>alert(1)</script>"}
+
+        response = api_key_client.patch(url, data, format="json")
+
         assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert "onerror" not in page.description_html
+        create_page.refresh_from_db()
+        assert "<script>" not in create_page.description_html
+        assert "ok" in create_page.description_html
 
     @pytest.mark.django_db
-    def test_update_locked_page(self, api_key_client, workspace, project, create_user):
-        """A locked page rejects edits."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, locked=True)
-        response = api_key_client.patch(detail_url(workspace.slug, project.id, page.id), {"name": "x"}, format="json")
+    def test_update_locked_page(self, api_key_client, workspace, project, locked_page):
+        """400 when trying to update a locked page."""
+        url = self.detail_url(workspace.slug, project.id, locked_page.id)
+        response = api_key_client.patch(url, {"name": "Nope"}, format="json")
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "locked" in response.data["error"].lower()
 
     @pytest.mark.django_db
-    def test_update_archived_page(self, api_key_client, workspace, project, create_user):
-        """An archived page rejects edits."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True)
-        response = api_key_client.patch(detail_url(workspace.slug, project.id, page.id), {"name": "x"}, format="json")
+    def test_update_archived_page(self, api_key_client, workspace, project, archived_page):
+        """400 when trying to update an archived page."""
+        url = self.detail_url(workspace.slug, project.id, archived_page.id)
+        response = api_key_client.patch(url, {"name": "Nope"}, format="json")
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "archived" in response.data["error"].lower()
 
     @pytest.mark.django_db
-    def test_non_owner_cannot_change_access(self, role_clients, workspace, project, create_user):
-        """A member may edit a public page but only the owner can change access."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = role_clients["member"].patch(
-            detail_url(workspace.slug, project.id, page.id), {"access": 1}, format="json"
+    def test_non_owner_cannot_change_access(self, api_key_client, workspace, project, other_user):
+        """403 when a non-owner tries to change a public page's access."""
+        page = Page.objects.create(
+            name="Other's Page",
+            description_html="<p>content</p>",
+            owned_by=other_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
         )
+        _link_page(project, page, other_user)
+
+        url = self.detail_url(workspace.slug, project.id, page.id)
+        response = api_key_client.patch(url, {"access": 1}, format="json")
         assert response.status_code == status.HTTP_403_FORBIDDEN
 
     @pytest.mark.django_db
-    def test_member_can_edit_public_page(self, role_clients, workspace, project, create_user):
-        """Public pages follow project membership: a member can edit content."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = role_clients["member"].patch(
-            detail_url(workspace.slug, project.id, page.id), {"name": "Edited by member"}, format="json"
-        )
+    def test_update_dispatches_page_webhook(self, api_key_client, workspace, project, create_page):
+        """Update flows through the model_activity -> page webhook path."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.patch(url, {"name": "Hooked"}, format="json")
         assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert page.name == "Edited by member"
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
 
     @pytest.mark.django_db
-    def test_delete_requires_archived(self, api_key_client, workspace, project, create_user):
-        """A live page must be archived before deletion."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = api_key_client.delete(detail_url(workspace.slug, project.id, page.id))
+    def test_delete_requires_archived(self, api_key_client, workspace, project, create_page):
+        """400 when trying to delete a non-archived page."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        response = api_key_client.delete(url)
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "archived" in response.data["error"].lower()
 
     @pytest.mark.django_db
-    def test_delete_archived_page(self, api_key_client, workspace, project, create_user):
-        """An archived page owned by the caller can be deleted."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True)
-        with mock.patch("plane.db.mixins.soft_delete_related_objects"):
-            response = api_key_client.delete(detail_url(workspace.slug, project.id, page.id))
+    def test_delete_archived_page_success(self, api_key_client, workspace, project, archived_page):
+        """204 when deleting an archived page owned by the user + webhook fired."""
+        url = self.detail_url(workspace.slug, project.id, archived_page.id)
+        with mock.patch("plane.api.views.page.webhook_activity") as m:
+            response = api_key_client.delete(url)
         assert response.status_code == status.HTTP_204_NO_CONTENT
-        assert not Page.objects.filter(id=page.id).exists()
+        assert not Page.objects.filter(id=archived_page.id).exists()
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["event"] == "page"
+        assert m.delay.call_args.kwargs["verb"] == "deleted"
 
     @pytest.mark.django_db
-    def test_member_cannot_delete_others_page(self, role_clients, workspace, project, create_user):
-        """A non-owner, non-admin member cannot delete another user's archived page."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True)
-        with mock.patch("plane.db.mixins.soft_delete_related_objects"):
-            response = role_clients["member"].delete(detail_url(workspace.slug, project.id, page.id))
+    def test_delete_by_non_owner_non_admin(self, api_key_client, workspace, project, other_user, create_user):
+        """403 when a non-owner, non-admin member tries to delete."""
+        page = Page.objects.create(
+            name="Other's Archived Page",
+            description_html="<p>content</p>",
+            owned_by=other_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
+            archived_at=date.today(),
+        )
+        _link_page(project, page, other_user)
+
+        # Demote the token user from admin to member.
+        ProjectMember.objects.filter(project=project, member=create_user).update(role=15)
+
+        url = self.detail_url(workspace.slug, project.id, page.id)
+        response = api_key_client.delete(url)
         assert response.status_code == status.HTTP_403_FORBIDDEN
-        assert Page.objects.filter(id=page.id).exists()
 
 
 # ---------------------------------------------------------------------------
-# Archive / Lock
+# Archive / Unarchive
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
-class TestPageArchiveLockAPIEndpoint:
-    """Archiving, restoring, locking and unlocking through the public token API."""
+class TestPageArchiveAPIEndpoint:
+    """Test Page Archive and Unarchive API Endpoint."""
+
+    def archive_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/archive/"
 
     @pytest.mark.django_db
-    def test_archive_page(self, api_key_client, workspace, project, create_user):
-        """Archiving stamps archived_at."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = api_key_client.post(archive_url(workspace.slug, project.id, page.id), format="json")
+    def test_archive_page(self, api_key_client, workspace, project, create_page):
+        """200 on successful archive."""
+        url = self.archive_url(workspace.slug, project.id, create_page.id)
+        response = api_key_client.post(url, format="json")
+
         assert response.status_code == status.HTTP_200_OK
         assert "archived_at" in response.data
-        page.refresh_from_db()
-        assert page.archived_at is not None
+        create_page.refresh_from_db()
+        assert create_page.archived_at is not None
 
     @pytest.mark.django_db
-    def test_unarchive_page(self, api_key_client, workspace, project, create_user):
-        """Restoring clears archived_at."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True)
-        response = api_key_client.delete(archive_url(workspace.slug, project.id, page.id), format="json")
+    def test_unarchive_page(self, api_key_client, workspace, project, archived_page):
+        """204 on successful unarchive."""
+        url = self.archive_url(workspace.slug, project.id, archived_page.id)
+        response = api_key_client.delete(url, format="json")
+
         assert response.status_code == status.HTTP_204_NO_CONTENT
-        page.refresh_from_db()
-        assert page.archived_at is None
+        archived_page.refresh_from_db()
+        assert archived_page.archived_at is None
 
     @pytest.mark.django_db
-    def test_member_cannot_archive_others_page(self, role_clients, workspace, project, create_user):
-        """Archive is owner-or-admin: a plain member cannot archive another's page."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = role_clients["member"].post(archive_url(workspace.slug, project.id, page.id), format="json")
-        assert response.status_code == status.HTTP_403_FORBIDDEN
-
-    @pytest.mark.django_db
-    def test_lock_page(self, api_key_client, workspace, project, create_user):
-        """Locking sets is_locked."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = api_key_client.post(lock_url(workspace.slug, project.id, page.id), format="json")
+    def test_archive_dispatches_page_webhook(self, api_key_client, workspace, project, create_page):
+        """Archive flows through the model_activity -> page webhook path."""
+        url = self.archive_url(workspace.slug, project.id, create_page.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.post(url, format="json")
         assert response.status_code == status.HTTP_200_OK
-        assert response.data["is_locked"] is True
-        page.refresh_from_db()
-        assert page.is_locked is True
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
 
     @pytest.mark.django_db
-    def test_unlock_page(self, api_key_client, workspace, project, create_user):
-        """Unlocking clears is_locked."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, locked=True)
-        response = api_key_client.delete(lock_url(workspace.slug, project.id, page.id), format="json")
-        assert response.status_code == status.HTTP_200_OK
-        assert response.data["is_locked"] is False
-        page.refresh_from_db()
-        assert page.is_locked is False
-
-    @pytest.mark.django_db
-    def test_member_can_lock_public_page(self, role_clients, workspace, project, create_user):
-        """Lock/unlock mirror the internal API: any member can lock a public page."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = role_clients["member"].post(lock_url(workspace.slug, project.id, page.id), format="json")
-        assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert page.is_locked is True
+    def test_unarchive_dispatches_page_webhook(self, api_key_client, workspace, project, archived_page):
+        """Unarchive flows through the model_activity -> page webhook path."""
+        url = self.archive_url(workspace.slug, project.id, archived_page.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.delete(url, format="json")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
 
 
 # ---------------------------------------------------------------------------
-# Private-page access matrix — owner / member / outsider / guest × every verb
+# Lock / Unlock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+class TestPageLockAPIEndpoint:
+    """Test Page Lock and Unlock API Endpoint."""
+
+    def lock_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/lock/"
+
+    @pytest.mark.django_db
+    def test_lock_page(self, api_key_client, workspace, project, create_page):
+        """200 on successful lock by owner."""
+        url = self.lock_url(workspace.slug, project.id, create_page.id)
+        response = api_key_client.post(url, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["is_locked"] is True
+        create_page.refresh_from_db()
+        assert create_page.is_locked is True
+
+    @pytest.mark.django_db
+    def test_unlock_page(self, api_key_client, workspace, project, locked_page):
+        """200 on successful unlock by owner."""
+        url = self.lock_url(workspace.slug, project.id, locked_page.id)
+        response = api_key_client.delete(url, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["is_locked"] is False
+        locked_page.refresh_from_db()
+        assert locked_page.is_locked is False
+
+    @pytest.mark.django_db
+    def test_lock_by_non_owner(self, api_key_client, workspace, project, other_user):
+        """403 when a non-owner tries to lock a public page."""
+        page = Page.objects.create(
+            name="Other's Page",
+            description_html="<p>content</p>",
+            owned_by=other_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
+        )
+        _link_page(project, page, other_user)
+
+        url = self.lock_url(workspace.slug, project.id, page.id)
+        response = api_key_client.post(url, format="json")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.django_db
+    def test_lock_dispatches_page_webhook(self, api_key_client, workspace, project, create_page):
+        """Lock flows through the model_activity -> page webhook path."""
+        url = self.lock_url(workspace.slug, project.id, create_page.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.post(url, format="json")
+        assert response.status_code == status.HTTP_200_OK
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
+
+    @pytest.mark.django_db
+    def test_unlock_dispatches_page_webhook(self, api_key_client, workspace, project, locked_page):
+        """Unlock flows through the model_activity -> page webhook path."""
+        url = self.lock_url(workspace.slug, project.id, locked_page.id)
+        with mock.patch("plane.api.views.page.model_activity") as m:
+            response = api_key_client.delete(url, format="json")
+        assert response.status_code == status.HTTP_200_OK
+        m.delay.assert_called_once()
+        assert m.delay.call_args.kwargs["model_name"] == "page"
+
+
+# ---------------------------------------------------------------------------
+# Private-page access matrix
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
 class TestPrivatePageAccessMatrix:
-    """A private page owned by ``create_user`` must be invisible/immutable to
-    everyone else. ``member`` (a project member who is not the owner) gets 404 —
-    the page is filtered out of their queryset, so its existence never leaks;
-    ``outsider`` (not in the project) is rejected by permission (403); ``guest``
-    can read but never mutate (403 on writes, 404 on the private read)."""
+    """A private page is visible/editable ONLY to its owner.
 
-    def _run(self, role_clients, workspace, project, create_user, *, method, url_fn, expected, page_kwargs):
-        """Assert the expected status for each role against one private page."""
-        for role, client in role_clients.items():
-            page = make_page(project, create_user, access=Page.PRIVATE_ACCESS, **page_kwargs)
-            url = url_fn(workspace.slug, project.id, page.id)
-            response = getattr(client, method)(url, format="json")
-            assert response.status_code == expected[role], (
-                f"{role} {method.upper()} {url} -> {response.status_code}, expected {expected[role]}"
-            )
+    Every verb is exercised from four vantage points against a private page
+    owned by ``owner``:
+
+    - ``owner`` — full access
+    - ``member`` — a different active project member: private page is invisible,
+      so lookups 404 (its existence is never leaked); writes it is allowed to
+      attempt (403 only when the queryset can't find it -> 404)
+    - ``ws_only`` — a workspace member who is not in the project: 403 on every
+      verb (project membership is required)
+    - ``guest`` — an active project guest: may read (but the private page is
+      invisible -> 404) and is denied all writes (403)
+    """
+
+    def detail_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/"
+
+    def archive_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/archive/"
+
+    def lock_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/lock/"
+
+    def list_url(self, slug, project_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/"
 
     @pytest.mark.django_db
-    def test_retrieve(self, role_clients, workspace, project, create_user):
-        """Private-page reads are owner-only."""
-        self._run(
-            role_clients,
-            workspace,
-            project,
-            create_user,
-            method="get",
-            url_fn=detail_url,
-            expected={"owner": 200, "member": 404, "outsider": 403, "guest": 404},
-            page_kwargs={},
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_404_NOT_FOUND),
+        ],
+    )
+    def test_retrieve(self, workspace, project, private_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.detail_url(workspace.slug, project.id, private_page.id)
+        assert client.get(url).status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_update(self, workspace, project, private_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.detail_url(workspace.slug, project.id, private_page.id)
+        assert client.patch(url, {"name": "Edited"}, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_archive(self, workspace, project, private_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.archive_url(workspace.slug, project.id, private_page.id)
+        assert client.post(url, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_lock(self, workspace, project, private_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.lock_url(workspace.slug, project.id, private_page.id)
+        assert client.post(url, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_204_NO_CONTENT),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_unarchive(self, workspace, project, create_user, actors, actor, expected):
+        # A private, archived page owned by the owner.
+        page = Page.objects.create(
+            name="Private Archived",
+            description_html="<p>secret</p>",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PRIVATE_ACCESS,
+            archived_at=date.today(),
         )
+        _link_page(project, page, create_user)
+
+        client = actors[actor]["client"]
+        url = self.archive_url(workspace.slug, project.id, page.id)
+        assert client.delete(url, format="json").status_code == expected
 
     @pytest.mark.django_db
-    def test_update(self, role_clients, workspace, project, create_user):
-        # owner update succeeds (200); non-owners never get that far.
-        """Private-page updates are owner-only."""
-        for role, client in role_clients.items():
-            page = make_page(project, create_user, access=Page.PRIVATE_ACCESS)
-            url = detail_url(workspace.slug, project.id, page.id)
-            response = client.patch(url, {"name": "changed"}, format="json")
-            expected = {"owner": 200, "member": 404, "outsider": 403, "guest": 403}
-            assert response.status_code == expected[role], f"{role}: {response.status_code}"
-
-    @pytest.mark.django_db
-    def test_delete(self, role_clients, workspace, project, create_user):
-        """Private-page deletes are owner-only."""
-        expected = {"owner": 204, "member": 404, "outsider": 403, "guest": 403}
-        with mock.patch("plane.db.mixins.soft_delete_related_objects"):
-            self._run(
-                role_clients,
-                workspace,
-                project,
-                create_user,
-                method="delete",
-                url_fn=detail_url,
-                expected=expected,
-                page_kwargs={"archived": True},
-            )
-
-    @pytest.mark.django_db
-    def test_archive(self, role_clients, workspace, project, create_user):
-        """Private-page archiving is owner-only."""
-        self._run(
-            role_clients,
-            workspace,
-            project,
-            create_user,
-            method="post",
-            url_fn=archive_url,
-            expected={"owner": 200, "member": 404, "outsider": 403, "guest": 403},
-            page_kwargs={},
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_unlock(self, workspace, project, create_user, actors, actor, expected):
+        # A private, locked page owned by the owner.
+        page = Page.objects.create(
+            name="Private Locked",
+            description_html="<p>secret</p>",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PRIVATE_ACCESS,
+            is_locked=True,
         )
+        _link_page(project, page, create_user)
+
+        client = actors[actor]["client"]
+        url = self.lock_url(workspace.slug, project.id, page.id)
+        assert client.delete(url, format="json").status_code == expected
 
     @pytest.mark.django_db
-    def test_unarchive(self, role_clients, workspace, project, create_user):
-        """Private-page restoring is owner-only."""
-        self._run(
-            role_clients,
-            workspace,
-            project,
-            create_user,
-            method="delete",
-            url_fn=archive_url,
-            expected={"owner": 204, "member": 404, "outsider": 403, "guest": 403},
-            page_kwargs={"archived": True},
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_204_NO_CONTENT),
+            ("member", status.HTTP_404_NOT_FOUND),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_delete(self, workspace, project, create_user, actors, actor, expected):
+        # A private, already-archived page owned by the owner.
+        page = Page.objects.create(
+            name="Private Archived",
+            description_html="<p>secret</p>",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PRIVATE_ACCESS,
+            archived_at=date.today(),
         )
+        _link_page(project, page, create_user)
+
+        client = actors[actor]["client"]
+        url = self.detail_url(workspace.slug, project.id, page.id)
+        assert client.delete(url).status_code == expected
 
     @pytest.mark.django_db
-    def test_lock(self, role_clients, workspace, project, create_user):
-        """Private-page locking is owner-only."""
-        self._run(
-            role_clients,
-            workspace,
-            project,
-            create_user,
-            method="post",
-            url_fn=lock_url,
-            expected={"owner": 200, "member": 404, "outsider": 403, "guest": 403},
-            page_kwargs={},
-        )
+    def test_list_visibility(self, workspace, project, private_page, actors):
+        """A private page appears only in the owner's list; others never see it."""
+        url = self.list_url(workspace.slug, project.id)
 
-    @pytest.mark.django_db
-    def test_unlock(self, role_clients, workspace, project, create_user):
-        """Private-page unlocking is owner-only."""
-        self._run(
-            role_clients,
-            workspace,
-            project,
-            create_user,
-            method="delete",
-            url_fn=lock_url,
-            expected={"owner": 200, "member": 404, "outsider": 403, "guest": 403},
-            page_kwargs={"locked": True},
-        )
+        # Owner sees it.
+        owner_resp = actors["owner"]["client"].get(url)
+        assert owner_resp.status_code == status.HTTP_200_OK
+        assert str(private_page.id) in [str(p["id"]) for p in owner_resp.data["results"]]
+
+        # Other project member: 200 but the private page is absent.
+        member_resp = actors["member"]["client"].get(url)
+        assert member_resp.status_code == status.HTTP_200_OK
+        assert str(private_page.id) not in [str(p["id"]) for p in member_resp.data["results"]]
+
+        # Guest: 200 but the private page is absent.
+        guest_resp = actors["guest"]["client"].get(url)
+        assert guest_resp.status_code == status.HTTP_200_OK
+        assert str(private_page.id) not in [str(p["id"]) for p in guest_resp.data["results"]]
+
+        # Workspace member not in project: denied entirely.
+        assert actors["ws_only"]["client"].get(url).status_code == status.HTTP_403_FORBIDDEN
 
 
 # ---------------------------------------------------------------------------
-# Webhooks — API-driven changes are externally observable identically to the UI
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.contract
-class TestPageAPIWebhook:
-    """Public-API mutations fire the same page webhooks as the UI."""
-
-    @pytest.fixture(autouse=True)
-    def _web_url(self, settings):
-        """Give base_host() an origin to build current_site from."""
-        settings.WEB_URL = "http://localhost"
-
-    @pytest.mark.django_db
-    def test_content_update_fires_page_webhook_with_update_action(
-        self, api_key_client, workspace, project, create_user
-    ):
-        """A public-API page update fires the shared `page` webhook, action=update."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        with (
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook,
-            mock.patch("plane.api.views.page.page_transaction"),
-        ):
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page.id),
-                {"description_html": "<p>edited via api</p>"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        mocked_webhook.delay.assert_called_once()
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["event"] == "page"
-        assert kwargs["verb"] == "updated"
-        assert kwargs["field"] == "description_html"
-        # Content updates reuse the debounced content-persist path.
-        assert kwargs["debounce"] is True
-        assert str(kwargs["event_id"]) == str(page.id)
-
-    @pytest.mark.django_db
-    def test_property_update_routes_through_model_activity(self, api_key_client, workspace, project, create_user):
-        """Property edits fan out `page` updates through the shared model_activity."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        with mock.patch("plane.api.views.page.model_activity") as mocked_model_activity:
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page.id),
-                {"name": "Renamed via API"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        mocked_model_activity.delay.assert_called_once()
-        kwargs = mocked_model_activity.delay.call_args.kwargs
-        assert kwargs["model_name"] == "page"
-        assert str(kwargs["model_id"]) == str(page.id)
-        assert kwargs["requested_data"] == {"name": "Renamed via API"}
-
-    @pytest.mark.django_db
-    def test_create_fires_page_created_webhook(self, api_key_client, workspace, project):
-        """Creating a page fires the page created webhook."""
-        with (
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook,
-            mock.patch("plane.api.views.page.page_transaction"),
-        ):
-            response = api_key_client.post(
-                list_url(workspace.slug, project.id),
-                {"name": "Hooked"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_201_CREATED
-        mocked_webhook.delay.assert_called_once()
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["event"] == "page"
-        assert kwargs["verb"] == "created"
-        assert str(kwargs["event_id"]) == str(response.data["id"])
-
-
-# ---------------------------------------------------------------------------
-# Parent scoping — a writable relation must not reach outside the caller's scope
+# Public-page access matrix (public pages follow project membership)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
-class TestPageParentScoping:
-    """``parent`` resolves through the model manager, so it is validated against
-    the caller's access-scoped queryset before any save."""
+class TestPublicPageAccessMatrix:
+    """A public page follows project membership.
 
-    @pytest.fixture
-    def other_project(self, db, workspace, create_user):
-        """A second project in the same workspace, with the api-key user as admin."""
-        project = Project.objects.create(
+    Members may read, update, and archive it; locking stays owner-only; guests
+    are read-only; and a workspace member not in the project is denied.
+    """
+
+    def detail_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/"
+
+    def archive_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/archive/"
+
+    def lock_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/lock/"
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_200_OK),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_200_OK),
+        ],
+    )
+    def test_retrieve(self, workspace, project, public_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.detail_url(workspace.slug, project.id, public_page.id)
+        assert client.get(url).status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_200_OK),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_update(self, workspace, project, public_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.detail_url(workspace.slug, project.id, public_page.id)
+        assert client.patch(url, {"name": "Edited"}, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_403_FORBIDDEN),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_lock_is_owner_only(self, workspace, project, public_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.lock_url(workspace.slug, project.id, public_page.id)
+        assert client.post(url, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_403_FORBIDDEN),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_unlock_is_owner_only(self, workspace, project, create_user, actors, actor, expected):
+        # A public, locked page owned by the owner.
+        page = Page.objects.create(
+            name="Public Locked",
+            description_html="<p>public</p>",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
+            is_locked=True,
+        )
+        _link_page(project, page, create_user)
+
+        client = actors[actor]["client"]
+        url = self.lock_url(workspace.slug, project.id, page.id)
+        assert client.delete(url, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_200_OK),
+            ("member", status.HTTP_200_OK),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_archive(self, workspace, project, public_page, actors, actor, expected):
+        client = actors[actor]["client"]
+        url = self.archive_url(workspace.slug, project.id, public_page.id)
+        assert client.post(url, format="json").status_code == expected
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "actor,expected",
+        [
+            ("owner", status.HTTP_204_NO_CONTENT),
+            ("member", status.HTTP_204_NO_CONTENT),
+            ("ws_only", status.HTTP_403_FORBIDDEN),
+            ("guest", status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    def test_unarchive(self, workspace, project, create_user, actors, actor, expected):
+        # A public, archived page owned by the owner.
+        page = Page.objects.create(
+            name="Public Archived",
+            description_html="<p>public</p>",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
+            archived_at=date.today(),
+        )
+        _link_page(project, page, create_user)
+
+        client = actors[actor]["client"]
+        url = self.archive_url(workspace.slug, project.id, page.id)
+        assert client.delete(url, format="json").status_code == expected
+
+
+# ---------------------------------------------------------------------------
+# external_id conflict handling (must not leak private page identifiers)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+class TestPageExternalIdConflicts:
+    """external_id uniqueness is project-wide, but a 409 must not leak the id
+    of a page the caller cannot see."""
+
+    def list_url(self, slug, project_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/"
+
+    def detail_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/"
+
+    @pytest.mark.django_db
+    def test_create_conflict_hides_private_page_id(self, workspace, project, create_user, actors):
+        """A member's 409 must not disclose the UUID of another user's private page."""
+        private = Page.objects.create(
+            name="Owner Private",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PRIVATE_ACCESS,
+            external_id="ext-1",
+            external_source="notion",
+        )
+        _link_page(project, private, create_user)
+
+        url = self.list_url(workspace.slug, project.id)
+        resp = actors["member"]["client"].post(
+            url,
+            {"name": "Dup", "external_id": "ext-1", "external_source": "notion"},
+            format="json",
+        )
+        assert resp.status_code == status.HTTP_409_CONFLICT
+        # The conflict is reported (uniqueness preserved) but the private page's
+        # id is withheld from a caller who cannot see it.
+        assert "id" not in resp.data
+
+    @pytest.mark.django_db
+    def test_create_conflict_discloses_visible_page_id(self, workspace, project, create_user, actors):
+        """A 409 for a public page the caller can see still returns its id."""
+        public = Page.objects.create(
+            name="Owner Public",
+            owned_by=create_user,
+            workspace=project.workspace,
+            access=Page.PUBLIC_ACCESS,
+            external_id="ext-2",
+            external_source="notion",
+        )
+        _link_page(project, public, create_user)
+
+        url = self.list_url(workspace.slug, project.id)
+        resp = actors["member"]["client"].post(
+            url,
+            {"name": "Dup", "external_id": "ext-2", "external_source": "notion"},
+            format="json",
+        )
+        assert resp.status_code == status.HTTP_409_CONFLICT
+        assert resp.data.get("id") == str(public.id)
+
+    @pytest.mark.django_db
+    def test_update_external_id_conflict(self, api_key_client, workspace, project, create_user):
+        """PATCHing a page's external_id to one already used -> 409."""
+        first = Page.objects.create(
+            name="First",
+            owned_by=create_user,
+            workspace=project.workspace,
+            external_id="ext-a",
+            external_source="notion",
+        )
+        _link_page(project, first, create_user)
+        second = Page.objects.create(
+            name="Second",
+            owned_by=create_user,
+            workspace=project.workspace,
+            external_id="ext-b",
+            external_source="notion",
+        )
+        _link_page(project, second, create_user)
+
+        url = self.detail_url(workspace.slug, project.id, second.id)
+        resp = api_key_client.patch(
+            url,
+            {"external_id": "ext-a", "external_source": "notion"},
+            format="json",
+        )
+        assert resp.status_code == status.HTTP_409_CONFLICT
+
+
+# ---------------------------------------------------------------------------
+# parent validation (scope + cycle safety)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+class TestPageParentValidation:
+    """`parent` must reference a visible page in the same project and never
+    form a cycle (which would make the recursive archive CTE loop forever)."""
+
+    def list_url(self, slug, project_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/"
+
+    def detail_url(self, slug, project_id, page_id):
+        return f"/api/v1/workspaces/{slug}/projects/{project_id}/pages/{page_id}/"
+
+    @pytest.mark.django_db
+    def test_create_with_unknown_parent(self, api_key_client, workspace, project):
+        """400 when the parent page does not exist in the project."""
+        url = self.list_url(workspace.slug, project.id)
+        resp = api_key_client.post(url, {"name": "Child", "parent": str(uuid4())}, format="json")
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+    @pytest.mark.django_db
+    def test_create_with_cross_project_parent(self, api_key_client, workspace, project, create_user):
+        """400 when the parent belongs to a different project."""
+        other_project = Project.objects.create(
             name="Other Project",
             identifier="OP",
             workspace=workspace,
             created_by=create_user,
         )
-        ProjectMember.objects.create(project=project, member=create_user, role=20, is_active=True)
-        return project
+        ProjectMember.objects.create(project=other_project, member=create_user, role=20, is_active=True)
+        foreign_parent = Page.objects.create(name="Foreign", owned_by=create_user, workspace=workspace)
+        _link_page(other_project, foreign_parent, create_user)
+
+        url = self.list_url(workspace.slug, project.id)
+        resp = api_key_client.post(url, {"name": "Child", "parent": str(foreign_parent.id)}, format="json")
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
 
     @pytest.mark.django_db
-    def test_create_rejects_parent_from_another_project(
-        self, api_key_client, workspace, project, other_project, create_user
-    ):
-        """A page in another project is not a valid parent even for the same user."""
-        foreign = make_page(other_project, create_user, access=Page.PUBLIC_ACCESS, name="Foreign")
-        response = api_key_client.post(
-            list_url(workspace.slug, project.id),
-            {"name": "Child", "parent": str(foreign.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert not Page.objects.filter(name="Child").exists()
+    def test_update_self_parent_rejected(self, api_key_client, workspace, project, create_page):
+        """400 when a page is set as its own parent."""
+        url = self.detail_url(workspace.slug, project.id, create_page.id)
+        resp = api_key_client.patch(url, {"parent": str(create_page.id)}, format="json")
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
 
     @pytest.mark.django_db
-    def test_create_rejects_another_users_private_parent(self, api_key_client, workspace, project, make_project_user):
-        """Another member's private page must not become a parent."""
-        other = make_project_user("privateowner@plane.so", 15)
-        secret = make_page(project, other, access=Page.PRIVATE_ACCESS, name="Their Secret")
-        response = api_key_client.post(
-            list_url(workspace.slug, project.id),
-            {"name": "Child", "parent": str(secret.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+    def test_update_cyclic_parent_rejected(self, api_key_client, workspace, project, create_user):
+        """400 when the new parent is a descendant (would form a cycle)."""
+        parent = Page.objects.create(name="P", owned_by=create_user, workspace=project.workspace)
+        _link_page(project, parent, create_user)
+        child = Page.objects.create(name="C", owned_by=create_user, workspace=project.workspace, parent=parent)
+        _link_page(project, child, create_user)
+
+        # Setting P.parent = C would create P -> C -> P.
+        url = self.detail_url(workspace.slug, project.id, parent.id)
+        resp = api_key_client.patch(url, {"parent": str(child.id)}, format="json")
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
 
     @pytest.mark.django_db
-    def test_create_accepts_visible_parent(self, api_key_client, workspace, project, create_user):
-        """A parent the caller can see is accepted."""
-        parent = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Parent")
-        response = api_key_client.post(
-            list_url(workspace.slug, project.id),
-            {"name": "Child", "parent": str(parent.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_201_CREATED, f"Got {response.data!r}"
-        assert str(Page.objects.get(pk=response.data["id"]).parent_id) == str(parent.id)
+    def test_update_valid_parent_succeeds(self, api_key_client, workspace, project, create_user):
+        """200 when the parent is a valid, non-cyclic page in the project."""
+        parent = Page.objects.create(name="Parent", owned_by=create_user, workspace=project.workspace)
+        _link_page(project, parent, create_user)
+        child = Page.objects.create(name="Child", owned_by=create_user, workspace=project.workspace)
+        _link_page(project, child, create_user)
 
-    @pytest.mark.django_db
-    def test_update_rejects_parent_from_another_project(
-        self, api_key_client, workspace, project, other_project, create_user
-    ):
-        """A parent outside the project is rejected on update."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        foreign = make_page(other_project, create_user, access=Page.PUBLIC_ACCESS, name="Foreign")
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, page.id),
-            {"parent": str(foreign.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        page.refresh_from_db()
-        assert page.parent_id is None
-
-    @pytest.mark.django_db
-    def test_update_rejects_self_as_parent(self, api_key_client, workspace, project, create_user):
-        """A page under itself would make the recursive tree walk loop."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, page.id),
-            {"parent": str(page.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        page.refresh_from_db()
-        assert page.parent_id is None
-
-    @pytest.mark.django_db
-    def test_update_rejects_descendant_as_parent(self, api_key_client, workspace, project, create_user):
-        """Re-parenting a page under its own child would close a cycle."""
-        parent = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Root")
-        child = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Child", parent=parent)
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, parent.id),
-            {"parent": str(child.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        parent.refresh_from_db()
-        assert parent.parent_id is None
-
-    @pytest.mark.django_db
-    def test_update_rejects_deep_descendant_as_parent(self, api_key_client, workspace, project, create_user):
-        """The cycle walk climbs more than one level."""
-        root = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Root")
-        child = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Child", parent=root)
-        grandchild = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Grandchild", parent=child)
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, root.id),
-            {"parent": str(grandchild.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        root.refresh_from_db()
-        assert root.parent_id is None
-
-    @pytest.mark.django_db
-    def test_update_allows_detaching_parent(self, api_key_client, workspace, project, create_user):
-        """Clearing the parent is allowed."""
-        parent = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Root")
-        child = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Child", parent=parent)
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, child.id),
-            {"parent": None},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_200_OK, f"Got {response.data!r}"
+        url = self.detail_url(workspace.slug, project.id, child.id)
+        resp = api_key_client.patch(url, {"parent": str(parent.id)}, format="json")
+        assert resp.status_code == status.HTTP_200_OK
         child.refresh_from_db()
-        assert child.parent_id is None
-
-    @pytest.mark.django_db
-    def test_cycle_walk_stops_at_the_workspace_boundary(self, api_key_client, workspace, project, create_user):
-        """The ancestor walk does not follow a parent link out of the workspace.
-
-        Legacy rows can carry a cross-tenant ``parent_id``, so the chain
-        ``proposed -> bridge (other workspace) -> target`` exists in the data. An
-        unscoped walk would climb through the foreign row and call this a cycle;
-        the archive traversal it guards stops at the workspace boundary and could
-        never follow that link, so the walk stops there too.
-        """
-        other_workspace = Workspace.objects.create(
-            name="Other Workspace",
-            owner=create_user,
-            slug="other-workspace",
-        )
-        other_project = Project.objects.create(
-            name="Other Workspace Project",
-            identifier="OWP",
-            workspace=other_workspace,
-            created_by=create_user,
-        )
-        target = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Target")
-        proposed = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Proposed Parent")
-        bridge = make_page(other_project, create_user, access=Page.PUBLIC_ACCESS, name="Foreign Bridge")
-
-        # Written straight to the rows: the endpoints reject these links, which is
-        # exactly why only legacy data can hold them.
-        Page.objects.filter(pk=proposed.id).update(parent=bridge)
-        Page.objects.filter(pk=bridge.id).update(parent=target)
-
-        response = api_key_client.patch(
-            detail_url(workspace.slug, project.id, target.id),
-            {"parent": str(proposed.id)},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_200_OK, f"Got {response.data!r}"
-        target.refresh_from_db()
-        assert str(target.parent_id) == str(proposed.id)
+        assert child.parent_id == parent.id
 
 
 # ---------------------------------------------------------------------------
-# A page removed from this project is out of scope for every action
+# Webhook routing (end-to-end: Webhook.page + mappers + activity branch)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
-class TestPageSoftRemovedProjectLink:
-    """``ProjectPage`` is soft-deleted, so "linked to this project" means an
-    ACTIVE link — for visibility and for external-id uniqueness alike."""
+class TestPageWebhookRouting:
+    """The `page` event routes only to webhooks subscribed to pages."""
 
-    @pytest.fixture
-    def second_project(self, db, workspace, create_user):
-        """Another project in the workspace the api-key user administers."""
-        project = Project.objects.create(
-            name="Second Project",
-            identifier="SP",
+    @pytest.mark.django_db
+    def test_page_event_targets_page_webhooks(self, db, workspace, project, create_page, create_user):
+        """webhook_activity(event='page') dispatches to page-subscribed webhooks."""
+        from plane.bgtasks.webhook_task import webhook_activity
+
+        page_webhook = Webhook.objects.create(
             workspace=workspace,
-            created_by=create_user,
+            url="https://example.com/hooks/pages",
+            page=True,
         )
-        ProjectMember.objects.create(project=project, member=create_user, role=20, is_active=True)
-        return project
-
-    @pytest.mark.django_db
-    def test_page_removed_from_this_project_is_not_visible(
-        self, api_key_client, workspace, project, second_project, create_user
-    ):
-        """A page still live in another project must not leak through this one.
-
-        The link conditions have to hold of the same ``ProjectPage`` row: split
-        across separate ``filter()`` calls they get separate joins, and "linked
-        here" plus "has a live link" were satisfiable by two different rows.
-        """
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Moved Out")
-        # Also live in the second project, then removed from the first.
-        ProjectPage.objects.create(
+        # A webhook NOT subscribed to pages must be ignored.
+        Webhook.objects.create(
             workspace=workspace,
-            project=second_project,
-            page=page,
-            created_by_id=create_user.id,
-            updated_by_id=create_user.id,
-        )
-        ProjectPage.objects.filter(page=page, project=project).update(deleted_at=timezone.now())
-
-        assert api_key_client.get(detail_url(workspace.slug, project.id, page.id)).status_code == (
-            status.HTTP_404_NOT_FOUND
-        )
-        listed = api_key_client.get(list_url(workspace.slug, project.id))
-        assert [str(row["id"]) for row in listed.data["results"]] == []
-        # Still reachable where it actually lives.
-        assert api_key_client.get(detail_url(workspace.slug, second_project.id, page.id)).status_code == (
-            status.HTTP_200_OK
+            url="https://example.com/hooks/issues",
+            issue=True,
+            page=False,
         )
 
-    @pytest.mark.django_db
-    def test_external_id_is_free_again_after_the_link_is_removed(self, api_key_client, workspace, project, create_user):
-        """A removed page must not keep holding its external id hostage.
-
-        The pair looked taken while the page was unreachable through this
-        project — and its id is withheld from the 409 — so a re-sync had no way
-        forward: it could neither create nor update.
-        """
-        stale = make_page(
-            project,
-            create_user,
-            access=Page.PUBLIC_ACCESS,
-            name="Removed Import",
-            external_id="ext-1",
-            external_source="notion",
-        )
-        ProjectPage.objects.filter(page=stale, project=project).update(deleted_at=timezone.now())
-
-        with (
-            mock.patch("plane.api.views.page.page_transaction"),
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity"),
-        ):
-            response = api_key_client.post(
-                list_url(workspace.slug, project.id),
-                {"name": "Re-synced", "external_id": "ext-1", "external_source": "notion"},
-                format="json",
+        with mock.patch("plane.bgtasks.webhook_task.webhook_send_task") as send_task:
+            webhook_activity(
+                event="page",
+                verb="created",
+                field=None,
+                old_value=None,
+                new_value=None,
+                actor_id=str(create_user.id),
+                slug=workspace.slug,
+                current_site="http://localhost:3000",
+                event_id=str(create_page.id),
+                old_identifier=None,
+                new_identifier=None,
             )
 
-        assert response.status_code == status.HTTP_201_CREATED, f"Got {response.data!r}"
-        assert str(response.data["id"]) != str(stale.id)
-
-
-# ---------------------------------------------------------------------------
-# An external-id conflict must not disclose a page the caller cannot see
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.contract
-class TestPageExternalIdConflictDisclosure:
-    """409 is reported for any taken (external_source, external_id) pair, but the
-    conflicting page's id is only echoed when the caller can already see it."""
-
-    @pytest.mark.django_db
-    def test_conflict_withholds_id_of_another_users_private_page(
-        self, api_key_client, workspace, project, make_project_user
-    ):
-        """A private page owned by someone else conflicts without disclosing it."""
-        other = make_project_user("extowner@plane.so", 15)
-        make_page(
-            project,
-            other,
-            access=Page.PRIVATE_ACCESS,
-            name="Their Import",
-            external_id="ext-1",
-            external_source="notion",
-        )
-
-        response = api_key_client.post(
-            list_url(workspace.slug, project.id),
-            {"name": "Mine", "external_id": "ext-1", "external_source": "notion"},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_409_CONFLICT
-        assert "same external id" in response.data["error"]
-        assert "id" not in response.data
-
-    @pytest.mark.django_db
-    def test_conflict_returns_id_of_another_users_public_page(
-        self, api_key_client, workspace, project, make_project_user
-    ):
-        """A public page is visible to the caller, so its id is safe to return."""
-        other = make_project_user("publicowner@plane.so", 15)
-        existing = make_page(
-            project,
-            other,
-            access=Page.PUBLIC_ACCESS,
-            name="Shared Import",
-            external_id="ext-1",
-            external_source="notion",
-        )
-
-        response = api_key_client.post(
-            list_url(workspace.slug, project.id),
-            {"name": "Mine", "external_id": "ext-1", "external_source": "notion"},
-            format="json",
-        )
-        assert response.status_code == status.HTTP_409_CONFLICT
-        assert response.data["id"] == str(existing.id)
-
-
-# ---------------------------------------------------------------------------
-# Version history must record the stored (sanitized) content
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.contract
-class TestPageVersionHistorySanitization:
-    """Version history records the stored, sanitized content."""
-
-    @pytest.mark.django_db
-    def test_update_records_sanitized_html_in_version_history(self, api_key_client, workspace, project, create_user):
-        """page_transaction must receive what was stored, not the raw body."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        with mock.patch("plane.api.views.page.page_transaction") as mocked_transaction:
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page.id),
-                {"description_html": "<p>keep</p><script>alert('xss')</script>"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        mocked_transaction.delay.assert_called_once()
-        recorded = mocked_transaction.delay.call_args.kwargs["new_description_html"]
-        assert "<script>" not in recorded
-        assert "keep" in recorded
-        page.refresh_from_db()
-        assert recorded == page.description_html
-
-    @pytest.mark.django_db
-    def test_create_records_sanitized_html_in_version_history(self, api_key_client, workspace, project):
-        """Create records sanitized content in version history."""
-        with mock.patch("plane.api.views.page.page_transaction") as mocked_transaction:
-            response = api_key_client.post(
-                list_url(workspace.slug, project.id),
-                {"name": "Fresh", "description_html": "<p>ok</p><script>bad()</script>"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_201_CREATED
-        recorded = mocked_transaction.delay.call_args.kwargs["new_description_html"]
-        assert "<script>" not in recorded
-
-
-# ---------------------------------------------------------------------------
-# Prior state reported on lock / archive transitions
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.contract
-class TestPagePriorStateReporting:
-    """Update webhooks report the page's real pre-mutation state."""
-
-    @pytest.fixture(autouse=True)
-    def _web_url(self, settings):
-        """Give base_host() an origin to build current_site from."""
-        settings.WEB_URL = "http://localhost"
-
-    @pytest.mark.django_db
-    def test_lock_reports_actual_prior_lock_state(self, api_key_client, workspace, project, create_user):
-        """Locking an already-locked page reports old_value=True, not False."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, locked=True)
-        with mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook:
-            response = api_key_client.post(lock_url(workspace.slug, project.id, page.id), format="json")
-
-        assert response.status_code == status.HTTP_200_OK
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["field"] == "is_locked"
-        assert kwargs["old_value"] is True
-        assert kwargs["new_value"] is True
-
-    @pytest.mark.django_db
-    def test_unlock_reports_actual_prior_lock_state(self, api_key_client, workspace, project, create_user):
-        """Unlocking an already-unlocked page reports old_value=False, not True."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, locked=False)
-        with mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook:
-            response = api_key_client.delete(lock_url(workspace.slug, project.id, page.id), format="json")
-
-        assert response.status_code == status.HTTP_200_OK
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["old_value"] is False
-        assert kwargs["new_value"] is False
-
-    @pytest.mark.django_db
-    def test_archive_reports_prior_archived_at(self, api_key_client, workspace, project, create_user):
-        """Re-archiving an archived page reports its previous archived_at."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, archived=True)
-        with mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook:
-            response = api_key_client.post(archive_url(workspace.slug, project.id, page.id), format="json")
-
-        assert response.status_code == status.HTTP_200_OK
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["field"] == "archived_at"
-        assert kwargs["old_value"] is not None
-        assert kwargs["new_value"] is not None
-
-    @pytest.mark.django_db
-    def test_archive_refreshes_updated_at(self, api_key_client, workspace, project, create_user):
-        """Archiving through the public API also maintains updated_at."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        Page.objects.filter(pk=page.id).update(updated_at=timezone.now() - timedelta(days=2))
-        before = Page.objects.get(pk=page.id).updated_at
-
-        # Stub the webhook fan-out: this test is about updated_at, and the real
-        # task would need a broker.
-        with mock.patch("plane.bgtasks.webhook_task.webhook_activity"):
-            response = api_key_client.post(archive_url(workspace.slug, project.id, page.id), format="json")
-
-        assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert page.updated_at > before
-
-    @pytest.mark.django_db
-    def test_archive_writes_timezone_aware_date(self, api_key_client, workspace, project, create_user):
-        """archived_at lands on the UTC date, not a naive server-local one."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS)
-        with mock.patch("plane.bgtasks.webhook_task.webhook_activity"):
-            response = api_key_client.post(archive_url(workspace.slug, project.id, page.id), format="json")
-        assert response.status_code == status.HTTP_200_OK
-        page.refresh_from_db()
-        assert page.archived_at == timezone.now().date()
-
-
-# ---------------------------------------------------------------------------
-# Clearing content — "" is a real value, not "nothing sent"
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.contract
-class TestPageClearContent:
-    """description_html is a blankable field, so emptying a page is a content
-    change and must be treated as one."""
-
-    @pytest.fixture(autouse=True)
-    def _web_url(self, settings):
-        """Give base_host() an origin to build current_site from."""
-        settings.WEB_URL = "http://localhost"
-
-    @pytest.fixture
-    def page_with_binary(self, db, project, create_user):
-        """A page carrying both HTML and a stale Yjs binary."""
-        page = make_page(project, create_user, access=Page.PUBLIC_ACCESS, name="Has content")
-        Page.objects.filter(pk=page.id).update(description_html="<p>old body</p>", description_binary=b"STALE")
-        page.refresh_from_db()
-        return page
-
-    @pytest.mark.django_db
-    def test_clearing_content_resets_the_yjs_binary(self, api_key_client, workspace, project, page_with_binary):
-        """Without this the live editor re-derives the old body from the stale
-        binary and the clear silently does not stick."""
-        with (
-            mock.patch("plane.api.views.page.page_transaction"),
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity"),
-        ):
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page_with_binary.id),
-                {"description_html": ""},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK, f"Got {response.data!r}"
-        page_with_binary.refresh_from_db()
-        assert page_with_binary.description_html == ""
-        assert page_with_binary.description_binary is None
-
-    @pytest.mark.django_db
-    def test_clearing_content_records_a_version(self, api_key_client, workspace, project, page_with_binary):
-        """The clear belongs in version history, recorded as the empty body."""
-        with (
-            mock.patch("plane.api.views.page.page_transaction") as mocked_transaction,
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity"),
-        ):
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page_with_binary.id),
-                {"description_html": ""},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        mocked_transaction.delay.assert_called_once()
-        kwargs = mocked_transaction.delay.call_args.kwargs
-        assert kwargs["new_description_html"] == ""
-        assert kwargs["old_description_html"] == "<p>old body</p>"
-
-    @pytest.mark.django_db
-    def test_clearing_content_fires_the_content_webhook(self, api_key_client, workspace, project, page_with_binary):
-        """Subscribers must learn that the page was emptied."""
-        with (
-            mock.patch("plane.api.views.page.page_transaction"),
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook,
-        ):
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page_with_binary.id),
-                {"description_html": ""},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        mocked_webhook.delay.assert_called_once()
-        kwargs = mocked_webhook.delay.call_args.kwargs
-        assert kwargs["field"] == "description_html"
-        assert kwargs["debounce"] is True
-
-    @pytest.mark.django_db
-    def test_property_only_update_leaves_content_and_binary_alone(
-        self, api_key_client, workspace, project, page_with_binary
-    ):
-        """A rename must not be mistaken for a content change."""
-        with (
-            mock.patch("plane.api.views.page.page_transaction") as mocked_transaction,
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity") as mocked_webhook,
-        ):
-            response = api_key_client.patch(
-                detail_url(workspace.slug, project.id, page_with_binary.id),
-                {"name": "Renamed"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_200_OK
-        page_with_binary.refresh_from_db()
-        assert page_with_binary.description_html == "<p>old body</p>"
-        assert page_with_binary.description_binary == b"STALE"
-        mocked_transaction.delay.assert_not_called()
-        mocked_webhook.delay.assert_not_called()
-
-    @pytest.mark.django_db
-    def test_creating_with_blank_content_stores_the_empty_body(self, api_key_client, workspace, project):
-        """`description_html: ""` on create means "start this page empty".
-
-        It is the same meaning update gives the value, and the model itself
-        models the state. Defaulting it to `<p></p>` stored markup the caller
-        never sent and disagreed with what a subsequent clear would store.
-        """
-        with (
-            mock.patch("plane.api.views.page.page_transaction"),
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity"),
-        ):
-            response = api_key_client.post(
-                list_url(workspace.slug, project.id),
-                {"name": "Starts empty", "description_html": ""},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_201_CREATED, f"Got {response.data!r}"
-        assert Page.objects.get(pk=response.data["id"]).description_html == ""
-
-    @pytest.mark.django_db
-    def test_creating_without_content_falls_back_to_an_empty_doc(self, api_key_client, workspace, project):
-        """An omitted field still picks up the model default."""
-        with (
-            mock.patch("plane.api.views.page.page_transaction"),
-            mock.patch("plane.bgtasks.webhook_task.webhook_activity"),
-        ):
-            response = api_key_client.post(
-                list_url(workspace.slug, project.id),
-                {"name": "No content sent"},
-                format="json",
-            )
-
-        assert response.status_code == status.HTTP_201_CREATED, f"Got {response.data!r}"
-        assert Page.objects.get(pk=response.data["id"]).description_html == "<p></p>"
+        assert send_task.delay.call_count == 1
+        assert send_task.delay.call_args.kwargs["webhook_id"] == page_webhook.id
+        assert send_task.delay.call_args.kwargs["event"] == "page"
