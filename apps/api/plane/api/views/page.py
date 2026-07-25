@@ -27,7 +27,7 @@ from drf_spectacular.utils import (
 
 # Module imports
 from plane.api.serializers import PageAPISerializer, PageSearchSerializer
-from plane.app.permissions import ProjectEntityPermission
+from plane.app.permissions import ProjectEntityPermission, ROLE
 from plane.db.models import (
     Page,
     Project,
@@ -1001,7 +1001,6 @@ class PageSearchEndpoint(BaseAPIView):
             400: BAD_SEARCH_REQUEST_RESPONSE,
             401: UNAUTHORIZED_RESPONSE,
             403: FORBIDDEN_RESPONSE,
-            404: WORKSPACE_NOT_FOUND_RESPONSE,
         },
     )
     def get(self, request, slug):
@@ -1038,8 +1037,18 @@ class PageSearchEndpoint(BaseAPIView):
         # join does not fan out (and duplicate) rows:
         #   * only pages that belong to at least one project where the requesting
         #     user is an active member and the project is not archived,
+        #   * in a project where the user is only a guest, and that project has not
+        #     opted guests into seeing everything, only their own pages — the same
+        #     rule PageViewSet.list/retrieve enforce,
         #   * optionally narrowed to the requested projects.
+        #
+        # Every membership predicate stays in this single filter() call so they all
+        # bind to the SAME ProjectMember row; splitting them across filter() calls
+        # would let the role check match a different membership than the user's.
         accessible_project_pages = ProjectPage.objects.filter(
+            Q(project__project_projectmember__role__gt=ROLE.GUEST.value)
+            | Q(project__guest_view_all_features=True)
+            | Q(page__owned_by=request.user),
             page_id=OuterRef("pk"),
             project__project_projectmember__member=request.user,
             project__project_projectmember__is_active=True,
