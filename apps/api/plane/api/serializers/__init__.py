@@ -74,6 +74,7 @@ from .service_account import (
     ServiceAccountSerializer,
     ServiceAccountTokenCreateSerializer,
     ServiceAccountTokenCreatedSerializer,
+    ServiceAccountTokenRotateSerializer,
     ServiceAccountTokenSerializer,
 )
 from .sticky import StickySerializer
