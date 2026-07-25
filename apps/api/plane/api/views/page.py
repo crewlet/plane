@@ -15,6 +15,7 @@ from django.utils import timezone
 
 # Third party imports
 from rest_framework import status
+from rest_framework.exceptions import ParseError
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
@@ -35,6 +36,7 @@ from plane.db.models import (
     ProjectPage,
     UserFavorite,
     UserRecentVisit,
+    Workspace,
 )
 from plane.bgtasks.page_transaction_task import page_transaction
 from plane.bgtasks.webhook_task import model_activity, webhook_activity
@@ -924,6 +926,12 @@ class PageLockAPIEndpoint(PageAPIBaseView):
         )
 
 
+
+# The only columns the search response reads. Pages can hold very large bodies,
+# so loading them for every hit would pull megabytes out of the database just to
+# render a short snippet.
+PAGE_SEARCH_FIELDS = ("id", "name", "parent_id", "updated_at", "description_stripped")
+
 # Page size for search results. Each hit carries a text snippet, so results are
 # heavier than a plain id/name list; a smaller default keeps responses light and
 # matches the advertised PER_PAGE_PARAMETER contract (default 20, max 100).
@@ -1010,6 +1018,14 @@ class PageSearchEndpoint(BaseAPIView):
         content, scoped to the pages the requesting user is allowed to see.
         Results are cursor paginated.
         """
+        # An unknown slug would otherwise match no pages and look like a genuine
+        # empty result. Report it like the other token-API workspace endpoints do.
+        if not Workspace.objects.filter(slug=slug).exists():
+            return Response(
+                {"error": "Provided workspace does not exist"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         query = request.query_params.get("query", "").strip()
         if not query:
             return Response(
@@ -1045,11 +1061,16 @@ class PageSearchEndpoint(BaseAPIView):
         # Every membership predicate stays in this single filter() call so they all
         # bind to the SAME ProjectMember row; splitting them across filter() calls
         # would let the role check match a different membership than the user's.
+        #
+        # The subquery is pinned to the same workspace as the outer query so a
+        # ProjectPage row pointing at a project in another workspace could never
+        # let membership over there grant access to a page in this one.
         accessible_project_pages = ProjectPage.objects.filter(
             Q(project__project_projectmember__role__gt=ROLE.GUEST.value)
             | Q(project__guest_view_all_features=True)
             | Q(page__owned_by=request.user),
             page_id=OuterRef("pk"),
+            project__workspace__slug=slug,
             project__project_projectmember__member=request.user,
             project__project_projectmember__is_active=True,
             project__archived_at__isnull=True,
@@ -1070,17 +1091,24 @@ class PageSearchEndpoint(BaseAPIView):
                 has_access=Exists(accessible_project_pages),
             )
             .filter(has_access=True)
+            .only(*PAGE_SEARCH_FIELDS)
         )
 
         # Archived pages are excluded unless explicitly requested.
         if not include_archived:
             pages = pages.filter(archived_at__isnull=True)
 
-        return self.paginate(
-            request=request,
-            queryset=pages,
-            on_results=lambda results: PageSearchSerializer(results, many=True, context={"query": query}).data,
-            order_by="-updated_at",
-            default_per_page=PAGE_SEARCH_DEFAULT_PER_PAGE,
-            max_per_page=PAGE_SEARCH_MAX_PER_PAGE,
-        )
+        try:
+            return self.paginate(
+                request=request,
+                queryset=pages,
+                on_results=lambda results: PageSearchSerializer(results, many=True, context={"query": query}).data,
+                order_by="-updated_at",
+                default_per_page=PAGE_SEARCH_DEFAULT_PER_PAGE,
+                max_per_page=PAGE_SEARCH_MAX_PER_PAGE,
+            )
+        except ParseError as exc:
+            # The paginator reports bad cursor/per_page values as DRF's
+            # {"detail": ...}; restate them in the {"error": ...} envelope this
+            # endpoint uses for its own validation failures.
+            return Response({"error": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
