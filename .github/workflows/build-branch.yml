@@ -50,6 +50,15 @@ env:
 jobs:
   branch_build_setup:
     name: Build Setup
+    # Upstream-only. This workflow pushes to makeplane's Docker Hub account and
+    # builds on makeplane's private Docker Build Cloud endpoint, so in a fork
+    # every build job dies at `docker/login-action` with "Username and password
+    # required". Forks publish through `ghcr-build.yml` instead.
+    #
+    # Every other job in this workflow needs this one, so skipping it here skips
+    # the whole run. Keeping it to a single condition — rather than deleting the
+    # workflow — keeps this file mergeable with upstream.
+    if: github.repository == 'makeplane/plane'
     runs-on: ubuntu-22.04
     outputs:
       gh_branch_name: ${{ steps.set_env_variables.outputs.TARGET_BRANCH }}
