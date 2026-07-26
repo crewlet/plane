@@ -63,7 +63,6 @@ from .asset import (
     GenericAssetUpdateSerializer,
     FileAssetSerializer,
 )
-from .page import PageSearchSerializer
 from .invite import WorkspaceInviteSerializer
 from .member import (
     ProjectMemberSerializer,
@@ -80,4 +79,9 @@ from .service_account import (
 )
 from .sticky import StickySerializer
 from .webhook import WebhookSerializer, WebhookLiteSerializer
-from .page import PageSerializer, PageAPISerializer, PageLiteSerializer
+from .page import (
+    PageSerializer,
+    PageAPISerializer,
+    PageLiteSerializer,
+    PageSearchSerializer,
+)

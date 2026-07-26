@@ -67,8 +67,6 @@ from .intake import (
     IntakeIssueDetailAPIEndpoint,
 )
 
-from .page import PageSearchEndpoint
-
 from .asset import UserAssetEndpoint, UserServerAssetEndpoint, GenericAssetEndpoint
 
 from .user import UserEndpoint
@@ -97,4 +95,5 @@ from .page import (
     PageDetailAPIEndpoint,
     PageArchiveAPIEndpoint,
     PageLockAPIEndpoint,
+    PageSearchEndpoint,
 )

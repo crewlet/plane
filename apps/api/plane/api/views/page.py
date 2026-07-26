@@ -65,7 +65,6 @@ from plane.utils.openapi import (
     BAD_SEARCH_REQUEST_RESPONSE,
     UNAUTHORIZED_RESPONSE,
     FORBIDDEN_RESPONSE,
-    WORKSPACE_NOT_FOUND_RESPONSE,
     CONFLICT_RESPONSE,
     DELETED_RESPONSE,
     create_paginated_response,
@@ -924,9 +923,6 @@ class PageLockAPIEndpoint(PageAPIBaseView):
             {"is_locked": False},
             status=status.HTTP_200_OK,
         )
-
-
-
 # The only columns the search response reads. Pages can hold very large bodies,
 # so loading them for every hit would pull megabytes out of the database just to
 # render a short snippet.

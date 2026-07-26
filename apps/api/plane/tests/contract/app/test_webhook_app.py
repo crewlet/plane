@@ -25,7 +25,7 @@ class TestWebhookPageField:
         # The create/update path runs an SSRF check that resolves DNS; stub it so
         # the test stays hermetic and focused on the `page` flag wiring.
         """Allow the test webhook URL past the SSRF guard."""
-        with mock.patch("plane.app.serializers.webhook.validate_url"):
+        with mock.patch("plane.app.serializers.webhook.validate_webhook_url"):
             yield
 
     @pytest.mark.django_db
