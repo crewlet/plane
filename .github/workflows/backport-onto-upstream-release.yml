@@ -1,0 +1,155 @@
+name: Backport onto upstream release
+
+# Takes an upstream release tag (e.g. v0.29.1), replays this fork's backported
+# commits on top of it, tags the result with the *same* version, and publishes
+# container images for that tag.
+#
+# The result is a fork release that means "upstream v0.29.1 plus our patches",
+# so `APP_RELEASE=v0.29.1` against our registry gets you the upstream release
+# you expect with the backports already in it.
+#
+# How the patch set is identified: our `preview` is upstream's `preview` plus a
+# number of commits on top. The merge base of the two branches is therefore the
+# upstream commit we forked from, and everything after it is ours. `git rebase`
+# compares patch-ids as it replays, so any patch upstream has since merged is
+# dropped automatically instead of applying twice.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream release tag to build on, e.g. v0.29.1"
+        required: true
+        type: string
+      upstream_repo:
+        description: "Upstream repository"
+        required: false
+        default: "makeplane/plane"
+        type: string
+      force:
+        description: "Overwrite the tag if it already exists in this fork"
+        required: false
+        default: false
+        type: boolean
+      arm64:
+        description: "Also build linux/arm64 (slow — emulated on GitHub runners)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  backport:
+    name: Rebase backports onto ${{ inputs.upstream_tag }}
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.rebase.outputs.sha }}
+      tag: ${{ inputs.upstream_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # The rebase needs real history, not a shallow clone.
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${{ inputs.upstream_repo }}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${{ inputs.upstream_repo }}.git"
+
+          # --no-tags plus an explicit refspec keeps upstream's tags out of
+          # refs/tags/*. Without it, fetching would drag in every upstream tag
+          # and collide with the identically named tags this workflow creates.
+          git fetch --no-tags upstream preview:refs/upstream/preview
+          git fetch --no-tags upstream \
+            "refs/tags/${{ inputs.upstream_tag }}:refs/upstream/tags/${{ inputs.upstream_tag }}"
+
+      - name: Guard against clobbering an existing tag
+        if: ${{ !inputs.force }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ inputs.upstream_tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ inputs.upstream_tag }} already exists in this fork."
+            echo "Re-run with 'force' enabled if you intend to replace it."
+            exit 1
+          fi
+
+      - name: Replay backports onto the upstream tag
+        id: rebase
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          base=$(git merge-base refs/upstream/preview origin/preview)
+          echo "Fork point (last upstream commit we share): $base"
+
+          # Our patches were written against the fork point. Replaying them onto
+          # a release cut *before* that point means re-targeting them at older
+          # code, which is where conflicts come from — so say so upfront rather
+          # than letting the failure look mysterious.
+          if ! git merge-base --is-ancestor "$base" "refs/upstream/tags/${{ inputs.upstream_tag }}"; then
+            behind=$(git rev-list --count "refs/upstream/tags/${{ inputs.upstream_tag }}..$base")
+            echo "::warning::${{ inputs.upstream_tag }} predates this fork's base by ${behind} upstream commit(s); conflicts are likely."
+          fi
+
+          count=$(git rev-list --count "$base..origin/preview")
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No backported commits found between the fork point and preview."
+            exit 1
+          fi
+          echo "Replaying $count commit(s) onto ${{ inputs.upstream_tag }}:"
+          git log --oneline --reverse "$base..origin/preview"
+
+          git checkout -B "backport/${{ inputs.upstream_tag }}" origin/preview
+          if ! git rebase --onto "refs/upstream/tags/${{ inputs.upstream_tag }}" "$base"; then
+            echo "::error::Conflicts while replaying the backports onto ${{ inputs.upstream_tag }}."
+            echo "Conflicting files:"
+            git diff --name-only --diff-filter=U || true
+            git rebase --abort || true
+            echo "Resolve locally, push a branch, and tag it by hand:"
+            echo "  git rebase --onto refs/tags/${{ inputs.upstream_tag }} $base preview"
+            exit 1
+          fi
+
+          applied=$(git rev-list --count "refs/upstream/tags/${{ inputs.upstream_tag }}..HEAD")
+          echo "Applied $applied of $count commit(s); $((count - applied)) were already upstream."
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and push
+        run: |
+          set -euo pipefail
+          git tag -f -a "${{ inputs.upstream_tag }}" \
+            -m "${{ inputs.upstream_tag }} (upstream ${{ inputs.upstream_repo }} ${{ inputs.upstream_tag }} + backports)"
+          git push --force origin "backport/${{ inputs.upstream_tag }}"
+          git push --force origin "refs/tags/${{ inputs.upstream_tag }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Backport release \`${{ inputs.upstream_tag }}\`"
+            echo
+            echo "- Base: upstream \`${{ inputs.upstream_repo }}\` @ \`${{ inputs.upstream_tag }}\`"
+            echo "- Branch: \`backport/${{ inputs.upstream_tag }}\`"
+            echo "- Commit: \`${{ steps.rebase.outputs.sha }}\`"
+            echo
+            echo "Images are being published as \`${{ inputs.upstream_tag }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Publish images
+    needs: backport
+    # Pushing a tag with GITHUB_TOKEN does not start a new workflow run, so the
+    # build is invoked directly rather than left to the tag-push trigger.
+    uses: ./.github/workflows/ghcr-build.yml
+    with:
+      ref: ${{ needs.backport.outputs.sha }}
+      image_tag: ${{ needs.backport.outputs.tag }}
+      arm64: ${{ inputs.arm64 }}
+    permissions:
+      contents: read
+      packages: write

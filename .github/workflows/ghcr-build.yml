@@ -1,0 +1,164 @@
+name: Publish images to GHCR
+
+# Builds every Plane component image in this fork and publishes it to the GitHub
+# Container Registry under this repository's owner.
+#
+# Upstream's `build-branch.yml` cannot be used here: it pushes to makeplane's
+# Docker Hub account and builds on makeplane's private Docker Build Cloud
+# endpoint, neither of which a fork has credentials for. This workflow needs no
+# secrets at all — GHCR authenticates with the automatically provided
+# `GITHUB_TOKEN`.
+#
+# Image tags:
+#   push to `preview`   -> `preview` and `preview-<short sha>`
+#   push of tag `vX.Y.Z`-> `vX.Y.Z`, plus `latest` when the tag has no
+#                          pre-release suffix
+#   manual / called     -> whatever `image_tag` says
+#
+# Note: the very first successful run creates the packages as **private**. Make
+# them public (or grant pull access) under the org's Packages settings if the
+# images need to be pulled by machines that are not authenticated to GitHub.
+
+on:
+  push:
+    branches:
+      - preview
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (defaults to the branch this is run from)"
+        required: false
+        type: string
+      image_tag:
+        description: "Tag to publish the images under (e.g. v0.29.1 or preview)"
+        required: false
+        type: string
+      arm64:
+        description: "Also build linux/arm64 (slow — emulated on GitHub runners)"
+        required: false
+        default: false
+        type: boolean
+  # Lets the backport-onto-upstream-release workflow build a freshly created tag
+  # directly, rather than relying on a tag push to trigger this workflow. A push
+  # made with GITHUB_TOKEN deliberately does not start another workflow run, so
+  # without this the tagged images would never be built.
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      arm64:
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.image_tag || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.component.image }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          # `context` and `dockerfile` mirror upstream's build-branch.yml — the
+          # web/admin/space/live images need the monorepo root as context so the
+          # shared packages/* workspaces resolve, while api and proxy are built
+          # from their own directories.
+          - image: plane-frontend
+            context: .
+            dockerfile: ./apps/web/Dockerfile.web
+          - image: plane-space
+            context: .
+            dockerfile: ./apps/space/Dockerfile.space
+          - image: plane-admin
+            context: .
+            dockerfile: ./apps/admin/Dockerfile.admin
+          - image: plane-live
+            context: .
+            dockerfile: ./apps/live/Dockerfile.live
+          - image: plane-backend
+            context: ./apps/api
+            dockerfile: ./apps/api/Dockerfile.api
+          - image: plane-proxy
+            context: ./apps/proxy
+            dockerfile: ./apps/proxy/Dockerfile.ce
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve image name and tags
+        id: meta
+        run: |
+          set -euo pipefail
+
+          # GHCR rejects uppercase in image paths; org names may contain them.
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner}/${{ matrix.component.image }}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+          tags=""
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            # Manual run or called by the backport workflow.
+            tags="${image}:${{ inputs.image_tag }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+            tags="${image}:${version}"
+            # Only a clean semver tag moves `latest`; pre-releases such as
+            # v0.29.1-rc1 must never claim it.
+            if echo "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              tags="${tags},${image}:latest"
+            fi
+          else
+            # Branch build (preview). The sha-suffixed tag gives an immutable
+            # handle so a deployment can pin one exact preview build.
+            tags="${image}:preview,${image}:preview-$(git rev-parse --short HEAD)"
+          fi
+
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Publishing: ${tags}"
+
+      - name: Set up QEMU
+        if: ${{ inputs.arm64 }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component.context }}
+          file: ${{ matrix.component.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ inputs.arm64 && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          # Cache is scoped per image so the six parallel builds do not evict
+          # each other's layers.
+          cache-from: type=gha,scope=${{ matrix.component.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Plane ${{ matrix.component.image }} built from ${{ github.repository }} (upstream makeplane/plane plus backported patches)
