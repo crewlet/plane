@@ -1,0 +1,79 @@
+{{- $fullName := include "plane.fullname" . -}}
+{{- $storage := .Values.config.storage -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-config
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+data:
+  DEBUG: {{ .Values.config.debug | quote }}
+  GUNICORN_WORKERS: {{ .Values.config.gunicornWorkers | quote }}
+
+  # Every component is served from one origin through the proxy, so the app,
+  # admin, space and live base URLs are all the public URL; only the paths
+  # differ, and they match the routes in the proxy's Caddyfile.
+  WEB_URL: {{ .Values.config.webUrl | quote }}
+  APP_BASE_URL: {{ .Values.config.webUrl | quote }}
+  APP_BASE_PATH: "/"
+  ADMIN_BASE_URL: {{ .Values.config.webUrl | quote }}
+  ADMIN_BASE_PATH: "/god-mode/"
+  SPACE_BASE_URL: {{ .Values.config.webUrl | quote }}
+  SPACE_BASE_PATH: "/spaces/"
+  LIVE_BASE_URL: {{ .Values.config.webUrl | quote }}
+  LIVE_BASE_PATH: {{ printf "%s/" (.Values.live.basePath | trimSuffix "/") | quote }}
+
+  CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
+
+  # In-cluster address of the API, for the live server's server-to-server calls.
+  API_BASE_URL: {{ printf "http://%s-api:%v" $fullName .Values.api.port | quote }}
+
+  {{- if .Values.redis.enabled }}
+  REDIS_URL: {{ printf "redis://%s-redis:%v/" $fullName .Values.redis.port | quote }}
+  REDIS_HOST: {{ printf "%s-redis" $fullName | quote }}
+  REDIS_PORT: {{ .Values.redis.port | quote }}
+  {{- else }}
+  REDIS_URL: {{ required "redis.enabled is false, so externalRedis.url is required" .Values.externalRedis.url | quote }}
+  {{- end }}
+
+  {{- /*
+    AMQP_URL is deliberately not set: it would have to embed the broker
+    password, which lives in the secret. Plane assembles the broker URL from
+    these five variables instead, so only RABBITMQ_PASSWORD stays secret.
+  */}}
+  {{- if .Values.rabbitmq.enabled }}
+  RABBITMQ_HOST: {{ printf "%s-rabbitmq" $fullName | quote }}
+  RABBITMQ_PORT: {{ .Values.rabbitmq.port | quote }}
+  {{- else }}
+  RABBITMQ_HOST: {{ required "rabbitmq.enabled is false, so externalRabbitmq.host is required" .Values.externalRabbitmq.host | quote }}
+  RABBITMQ_PORT: {{ .Values.externalRabbitmq.port | quote }}
+  {{- end }}
+  RABBITMQ_USER: {{ .Values.rabbitmq.username | quote }}
+  RABBITMQ_VHOST: {{ .Values.rabbitmq.vhost | quote }}
+
+  USE_MINIO: {{ $storage.useMinio | quote }}
+  AWS_S3_BUCKET_NAME: {{ $storage.bucket | quote }}
+  AWS_REGION: {{ $storage.region | quote }}
+  SIGNED_URL_EXPIRATION: {{ $storage.signedUrlExpiration | quote }}
+  {{- with $storage.endpointUrl }}
+  AWS_S3_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- /*
+    Omitted entirely when empty so boto3 falls through to the service account's
+    web-identity credentials (IRSA) instead of being handed a blank key.
+  */}}
+  {{- with $storage.accessKeyId }}
+  AWS_ACCESS_KEY_ID: {{ . | quote }}
+  {{- end }}
+  {{- with $storage.secretAccessKey }}
+  AWS_SECRET_ACCESS_KEY: {{ . | quote }}
+  {{- end }}
+
+  FILE_SIZE_LIMIT: {{ .Values.config.fileSizeLimit | quote }}
+  API_KEY_RATE_LIMIT: {{ .Values.config.apiKeyRateLimit | quote }}
+  AUTHENTICATION_RATE_LIMIT: {{ .Values.config.authenticationRateLimit | quote }}
+  WEBHOOK_ALLOWED_IPS: {{ .Values.config.webhookAllowedIps | quote }}
+  WEBHOOK_ALLOWED_HOSTS: {{ .Values.config.webhookAllowedHosts | quote }}
+  {{- range $key, $value := .Values.config.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

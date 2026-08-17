@@ -1,0 +1,10 @@
+apiVersion: v2
+name: plane
+description: >-
+  Plane (community edition) for Kubernetes: the web, space, admin, live, api,
+  worker and beat components behind the Caddy proxy, plus the in-cluster Valkey
+  and RabbitMQ they depend on.
+type: application
+version: 0.1.0
+# Overridden by image.tag; the fork publishes a rolling `preview` tag.
+appVersion: "preview"

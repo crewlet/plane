@@ -1,0 +1,59 @@
+{{- $name := include "plane.componentName" (dict "root" . "component" "beat") -}}
+{{- /*
+  Celery beat. Exactly one replica by design -- a second scheduler would fire
+  every periodic task twice -- so the old pod is torn down before the new one
+  starts rather than overlapping.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beat
+spec:
+  replicas: {{ .Values.beat.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "plane.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beat
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: beat
+    spec:
+      serviceAccountName: {{ include "plane.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: beat
+          image: {{ include "plane.image" (dict "root" $ "suffix" "backend" "override" .Values.beat.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["./bin/docker-entrypoint-beat.sh"]
+          envFrom:
+            {{- include "plane.envFrom" . | nindent 12 }}
+          {{- /*
+            beat answers no ping of its own (it only publishes), so liveness is
+            just "the scheduler process is still there". It exits on a broker
+            failure, which the restart policy then handles.
+          */}}
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "pgrep -f 'celery.*beat' >/dev/null"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.beat.resources | nindent 12 }}

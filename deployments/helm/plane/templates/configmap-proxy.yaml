@@ -1,0 +1,49 @@
+{{- $fullName := include "plane.fullname" . -}}
+{{- /*
+  Kubernetes flavour of apps/proxy/Caddyfile.ce. Two things differ from the
+  compose one: upstreams are Services rather than compose service names, and
+  there is no MinIO route -- uploads go straight to S3 through presigned URLs.
+  TLS terminates at the ingress hop, so Caddy serves plain HTTP and requests no
+  certificates.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-proxy
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+data:
+  Caddyfile: |
+    {
+        admin off
+        auto_https off
+        servers {
+            max_header_size 25MB
+            client_ip_headers X-Forwarded-For X-Real-IP
+            trusted_proxies static {{ .Values.proxy.trustedProxies }}
+        }
+    }
+
+    :{{ .Values.proxy.containerPort }} {
+        request_body {
+            max_size {{ .Values.config.fileSizeLimit }}
+        }
+
+        # Caddy's own liveness/readiness, answered without touching a backend.
+        respond /_healthz 200
+
+        redir /spaces /spaces/ permanent
+        reverse_proxy /spaces/* {{ $fullName }}-space:{{ .Values.space.port }}
+
+        redir /god-mode /god-mode/ permanent
+        reverse_proxy /god-mode/* {{ $fullName }}-admin:{{ .Values.admin.port }}
+
+        reverse_proxy {{ .Values.live.basePath | trimSuffix "/" }}/* {{ $fullName }}-live:{{ .Values.live.port }}
+
+        reverse_proxy /api/* {{ $fullName }}-api:{{ .Values.api.port }}
+        reverse_proxy /auth/* {{ $fullName }}-api:{{ .Values.api.port }}
+        reverse_proxy /static/* {{ $fullName }}-api:{{ .Values.api.port }}
+
+        reverse_proxy /* {{ $fullName }}-web:{{ .Values.web.port }}
+    }

@@ -1,0 +1,83 @@
+{{- $fullName := include "plane.fullname" . -}}
+{{- $name := include "plane.componentName" (dict "root" . "component" "proxy") -}}
+{{- /*
+  The single entry point. Point whatever terminates traffic at this Service, and
+  nothing else in the release needs to be reachable from outside the namespace.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.proxy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "plane.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-proxy.yaml") . | sha256sum }}
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: proxy
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: proxy
+          image: {{ include "plane.image" (dict "root" $ "suffix" "proxy" "override" .Values.proxy.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.proxy.containerPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /_healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_healthz
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: {{ $fullName }}-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.proxy.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "plane.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy

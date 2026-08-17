@@ -1,0 +1,71 @@
+{{- $name := include "plane.componentName" (dict "root" . "component" "admin") -}}
+{{- /*
+  God-mode admin: a static bundle served by nginx from /god-mode. Like the web
+  app it is built with relative base URLs and needs no runtime configuration.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin
+spec:
+  replicas: {{ .Values.admin.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "plane.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: admin
+  template:
+    metadata:
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: admin
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: admin
+          image: {{ include "plane.image" (dict "root" $ "suffix" "admin" "override" .Values.admin.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.admin.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.admin.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /god-mode/
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /god-mode/
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.admin.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.admin.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "plane.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: admin
