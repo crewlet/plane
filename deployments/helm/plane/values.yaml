@@ -319,8 +319,20 @@ rabbitmq:
     limits:
       memory: 768Mi
 
-# Set redis.enabled/rabbitmq.enabled to false and point these at an external
-# endpoint (ElastiCache, Amazon MQ) to run without the in-cluster statefulsets.
+# Set redis.enabled/rabbitmq.enabled to false to run against endpoints outside
+# the release. There are then two ways to supply them:
+#
+#   1. Through extraEnvFrom, as REDIS_URL and AMQP_URL on the secret. Leave the
+#      values below empty. This is the right choice for a managed cache or
+#      broker, whose URLs carry credentials (and are usually TLS -- rediss:// and
+#      amqps://, both of which Plane and the live server handle) and so belong in
+#      a secret rather than a ConfigMap.
+#   2. Here, for an endpoint that needs no credentials in its URL. The broker
+#      password still comes from the secret as RABBITMQ_PASSWORD, since Plane
+#      assembles the broker URL from the parts below plus that password.
+#
+# Setting neither, with the statefulsets disabled and nothing in extraEnvFrom,
+# leaves the components with no cache or broker to reach.
 externalRedis:
   url: ""
 externalRabbitmq:

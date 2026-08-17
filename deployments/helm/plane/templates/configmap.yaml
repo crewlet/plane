@@ -28,28 +28,37 @@ data:
   # In-cluster address of the API, for the live server's server-to-server calls.
   API_BASE_URL: {{ printf "http://%s-api:%v" $fullName .Values.api.port | quote }}
 
+  {{- /*
+    Three ways to reach the cache, in order: the statefulset this chart runs,
+    a plaintext endpoint given in values, or -- when neither is set -- REDIS_URL
+    supplied through extraEnvFrom. That last one is the norm for a managed cache,
+    whose URL carries an auth token and so belongs in a secret, not a ConfigMap.
+  */}}
   {{- if .Values.redis.enabled }}
   REDIS_URL: {{ printf "redis://%s-redis:%v/" $fullName .Values.redis.port | quote }}
   REDIS_HOST: {{ printf "%s-redis" $fullName | quote }}
   REDIS_PORT: {{ .Values.redis.port | quote }}
-  {{- else }}
-  REDIS_URL: {{ required "redis.enabled is false, so externalRedis.url is required" .Values.externalRedis.url | quote }}
+  {{- else if .Values.externalRedis.url }}
+  REDIS_URL: {{ .Values.externalRedis.url | quote }}
   {{- end }}
 
   {{- /*
-    AMQP_URL is deliberately not set: it would have to embed the broker
-    password, which lives in the secret. Plane assembles the broker URL from
-    these five variables instead, so only RABBITMQ_PASSWORD stays secret.
+    Same three ways for the broker. With the statefulset or a plaintext endpoint
+    Plane assembles the URL from these parts, keeping only RABBITMQ_PASSWORD
+    secret; a managed broker instead supplies a complete AMQP_URL through
+    extraEnvFrom, which Plane prefers over the parts when both are present.
   */}}
   {{- if .Values.rabbitmq.enabled }}
   RABBITMQ_HOST: {{ printf "%s-rabbitmq" $fullName | quote }}
   RABBITMQ_PORT: {{ .Values.rabbitmq.port | quote }}
-  {{- else }}
-  RABBITMQ_HOST: {{ required "rabbitmq.enabled is false, so externalRabbitmq.host is required" .Values.externalRabbitmq.host | quote }}
-  RABBITMQ_PORT: {{ .Values.externalRabbitmq.port | quote }}
-  {{- end }}
   RABBITMQ_USER: {{ .Values.rabbitmq.username | quote }}
   RABBITMQ_VHOST: {{ .Values.rabbitmq.vhost | quote }}
+  {{- else if .Values.externalRabbitmq.host }}
+  RABBITMQ_HOST: {{ .Values.externalRabbitmq.host | quote }}
+  RABBITMQ_PORT: {{ .Values.externalRabbitmq.port | quote }}
+  RABBITMQ_USER: {{ .Values.rabbitmq.username | quote }}
+  RABBITMQ_VHOST: {{ .Values.rabbitmq.vhost | quote }}
+  {{- end }}
 
   USE_MINIO: {{ $storage.useMinio | quote }}
   AWS_S3_BUCKET_NAME: {{ $storage.bucket | quote }}
