@@ -1,0 +1,210 @@
+name: Helm chart
+
+# Validates the Plane Helm chart on every pull request that touches it, and
+# publishes it to the GitHub Container Registry as an OCI artifact when a new
+# version lands on `preview`.
+#
+# Publishing is driven by `version:` in Chart.yaml, bumped by hand. The publish
+# step refuses to overwrite a version that already exists in the registry, so a
+# chart change shipped without a version bump would silently never reach
+# consumers -- which is why the pull request job fails when the version is
+# unchanged.
+#
+# Consumers install it with:
+#   helm install plane oci://ghcr.io/crewlet/charts/plane --version X.Y.Z
+
+on:
+  pull_request:
+    branches:
+      - preview
+    paths:
+      - "deployments/helm/**"
+      - ".github/workflows/helm-chart.yml"
+  push:
+    branches:
+      - preview
+    paths:
+      - "deployments/helm/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CHART_DIR: deployments/helm/plane
+  CHART_NAME: plane
+
+jobs:
+  validate:
+    name: Validate chart
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: helm lint
+        run: helm lint "$CHART_DIR"
+
+      - name: Render every supported values permutation
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rendered
+
+          render() {
+            local name="$1"; shift
+            echo "==> $name"
+            helm template plane "$CHART_DIR" "$@" > "/tmp/rendered/${name}.yaml"
+          }
+
+          # 1. Chart defaults: in-cluster Valkey and RabbitMQ statefulsets.
+          render defaults
+
+          # 2. GitOps overlay: managed cache and broker, with REDIS_URL and
+          #    AMQP_URL arriving through extraEnvFrom rather than values.
+          render gitops \
+            --set image.repository=ghcr.io/crewlet/plane \
+            --set image.tag=preview \
+            --set imagePullSecrets[0].name=ghcr-pull \
+            --set redis.enabled=false \
+            --set rabbitmq.enabled=false \
+            --set secrets.create=false \
+            --set extraEnvFrom[0].secretRef.name=plane-secrets \
+            --set config.webUrl=https://plane.example.com \
+            --set config.corsAllowedOrigins=https://plane.example.com \
+            --set config.storage.bucket=example-uploads \
+            --set config.storage.region=us-east-2
+
+          # 3. External endpoints supplied in values rather than a secret.
+          render external \
+            --set redis.enabled=false \
+            --set rabbitmq.enabled=false \
+            --set externalRedis.url=redis://cache:6379/ \
+            --set externalRabbitmq.host=mq.internal
+
+          # 4. Chart-managed secret material.
+          render self-secrets \
+            --set secrets.create=true \
+            --set secrets.secretKey=x \
+            --set secrets.liveServerSecretKey=y \
+            --set secrets.rabbitmqPassword=z \
+            --set secrets.databaseUrl=postgres://u:p@h:5432/db
+
+      - name: Guards must reject an incomplete secret
+        run: |
+          set -euo pipefail
+          # secrets.create=true with no values must fail the render, not emit an
+          # empty SECRET_KEY into a cluster.
+          if helm template plane "$CHART_DIR" --set secrets.create=true >/dev/null 2>&1; then
+            echo "::error::secrets.create=true rendered without the required values; the guards are not firing."
+            exit 1
+          fi
+          echo "Guards fired as expected."
+
+      - name: Validate manifests against Kubernetes schemas
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          # -strict rejects unknown fields, which is what catches a typo that
+          # helm template alone renders happily.
+          /tmp/kubeconform -strict -summary -kubernetes-version 1.31.0 /tmp/rendered/*.yaml
+
+      - name: Require a chart version bump
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          chart_version() { awk '/^version:/ { print $2; exit }' "$1"; }
+
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          base=$(git show "FETCH_HEAD:$CHART_DIR/Chart.yaml" 2>/dev/null | awk '/^version:/ { print $2; exit }' || true)
+          head=$(chart_version "$CHART_DIR/Chart.yaml")
+
+          if [ -z "$base" ]; then
+            echo "No chart on ${{ github.base_ref }} yet; $head will be the first published version."
+            exit 0
+          fi
+
+          if [ "$base" = "$head" ]; then
+            echo "::error file=$CHART_DIR/Chart.yaml::Chart files changed but version is still $head."
+            echo "The publish job never overwrites an existing version, so this change would not reach the registry."
+            echo "Bump 'version:' in $CHART_DIR/Chart.yaml."
+            exit 1
+          fi
+
+          echo "Chart version $base -> $head"
+
+  publish:
+    name: Publish chart
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Resolve version and registry
+        id: meta
+        run: |
+          set -euo pipefail
+          # GHCR rejects uppercase in image paths; org names may contain them.
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          version=$(awk '/^version:/ { print $2; exit }' "$CHART_DIR/Chart.yaml")
+          echo "registry=ghcr.io/${owner}/charts" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Chart ${CHART_NAME} ${version} -> oci://ghcr.io/${owner}/charts"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Skip if this version is already published
+        id: exists
+        run: |
+          set -euo pipefail
+          if helm show chart \
+               "oci://${{ steps.meta.outputs.registry }}/$CHART_NAME" \
+               --version "${{ steps.meta.outputs.version }}" >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${{ steps.meta.outputs.version }} is already in the registry; nothing to publish."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package and push
+        if: steps.exists.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          helm package "$CHART_DIR" --destination /tmp/chart
+          helm push "/tmp/chart/${CHART_NAME}-${{ steps.meta.outputs.version }}.tgz" \
+            "oci://${{ steps.meta.outputs.registry }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Helm chart"
+            echo
+            if [ "${{ steps.exists.outputs.already }}" = "true" ]; then
+              echo "\`${{ steps.meta.outputs.version }}\` was already published — no change."
+            else
+              echo "Published \`${CHART_NAME}\` **${{ steps.meta.outputs.version }}**."
+            fi
+            echo
+            echo '```'
+            echo "helm install plane oci://${{ steps.meta.outputs.registry }}/${CHART_NAME} --version ${{ steps.meta.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
