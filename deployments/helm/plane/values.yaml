@@ -1,0 +1,340 @@
+# Plane (community edition) on Kubernetes.
+#
+# Six images make up a Plane install, all published side by side under one
+# registry namespace. `image.repository` is therefore a PREFIX, not a complete
+# reference -- each component appends its own suffix (-frontend, -space, -admin,
+# -live, -backend, -proxy). That way a GitOps layer can inject a single
+# image.repository/image.tag pair -- one image reference for the whole release,
+# which is all a generic Application template knows how to supply -- and still
+# resolve six distinct images. Set <component>.image to pin one component to an
+# unrelated reference.
+image:
+  repository: ghcr.io/crewlet/plane
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Pull secrets for the private GHCR images. Create a docker-registry secret in
+# the release namespace (e.g. "ghcr-pull") and reference it here by name.
+imagePullSecrets: []
+# - name: ghcr-pull
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  # IRSA: the api/worker/beat pods reach the uploads bucket through the
+  # service account rather than static keys, so AWS_ACCESS_KEY_ID and
+  # AWS_SECRET_ACCESS_KEY below stay empty and boto3 falls back to the
+  # web-identity credentials. Empty by default because a GitOps deploy
+  # normally injects the role ARN; set it here for a standalone
+  # `helm install`.
+  annotations: {}
+  #   eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+
+# Non-secret runtime configuration. Rendered into the shared ConfigMap and
+# handed to the api, worker, beat, migrator and live components.
+config:
+  # Public origin Plane is served on, scheme included. Every component is served
+  # from this single origin through the proxy, so it doubles as the app, admin,
+  # space and live base URL.
+  webUrl: "http://localhost"
+  # Comma-separated origins allowed to call the API. Django derives its CSRF
+  # trusted origins from the same list, and marks session/CSRF cookies Secure
+  # when every entry is https.
+  corsAllowedOrigins: "http://localhost"
+  debug: "0"
+  gunicornWorkers: "2"
+  # Maximum accepted upload size in bytes (5 MiB). Enforced by both Django and
+  # the proxy's request body limit.
+  fileSizeLimit: "5242880"
+  apiKeyRateLimit: "60/minute"
+  authenticationRateLimit: "10/minute"
+  # Comma-separated IPs/CIDRs and hostnames that may be webhook targets even
+  # when they resolve to private networks. Leave empty to keep the SSRF guard
+  # fully closed.
+  webhookAllowedIps: ""
+  webhookAllowedHosts: ""
+
+  storage:
+    # 0 selects real S3; the chart deploys no MinIO.
+    useMinio: "0"
+    bucket: ""
+    region: ""
+    # Leave empty for AWS S3 so boto3 resolves the regional endpoint itself.
+    # Set it for an S3-compatible store (MinIO, R2, Ceph).
+    endpointUrl: ""
+    # Lifetime of the presigned upload/download URLs the API hands to browsers.
+    # Under IRSA a presigned URL also dies with the session that signed it, so
+    # keep this well under the role's session duration.
+    signedUrlExpiration: "3600"
+    # Static credentials for stores that have no IRSA equivalent. Leave both
+    # empty on EKS: the env vars are then omitted entirely and boto3 picks up
+    # the service account's web-identity credentials.
+    accessKeyId: ""
+    secretAccessKey: ""
+
+  # Free-form extra environment merged into the shared ConfigMap. Use for the
+  # settings this chart does not model (SMTP, Unsplash, PostHog, ...).
+  extraEnv: {}
+  #   POSTHOG_API_KEY: "phc_..."
+
+# Secret material. Leave create=false to consume a secret managed out of band
+# (External Secrets, SealedSecrets, ...) named by existingSecret; that secret
+# must carry SECRET_KEY, LIVE_SERVER_SECRET_KEY, RABBITMQ_PASSWORD and
+# DATABASE_URL, and the extraEnvFrom entry below is what hands it to the pods.
+# Set create=true only when the release manages its own secret material.
+secrets:
+  create: false
+  # Consulted whenever a component needs one specific key rather than the whole
+  # secret (RabbitMQ's default password), so it must name the same secret the
+  # extraEnvFrom entry below references.
+  existingSecret: "plane-secrets"
+  secretKey: ""            # Django SECRET_KEY
+  liveServerSecretKey: ""  # shared secret between the api and the live server
+  rabbitmqPassword: ""     # also seeds the in-cluster broker's default user
+  databaseUrl: ""          # postgres://user:pass@host:5432/db?sslmode=require
+
+# Additional env references layered on top of the shared ConfigMap (e.g. an
+# externally managed secret). Later entries win over earlier ones.
+extraEnvFrom: []
+# - secretRef:
+#     name: plane-secrets
+
+# Applied to every container unless a component overrides it below. The upstream
+# Plane images run as root and write inside their working directory
+# (collectstatic output, rotating logs, Caddy's data dir), so runAsNonRoot and
+# readOnlyRootFilesystem are deliberately not set -- dropping capabilities and
+# privilege escalation is what these images support without patching.
+#
+# The four components that DO shed root themselves (web and admin, whose nginx
+# master hands workers to the `nginx` user; redis and rabbitmq, whose entrypoints
+# chown the data dir and gosu into the service user) add back exactly the
+# capabilities that transition needs. Dropping ALL there would leave nginx unable
+# to start its workers and gosu unable to call setuid.
+podSecurityContext: {}
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# --------------------------------------------------------------------------
+# Components
+# --------------------------------------------------------------------------
+
+# Django ASGI application. Serves /api, /auth and /static.
+api:
+  replicaCount: 2
+  port: 8000
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+# Celery worker draining the RabbitMQ queues (emails, exports, notifications).
+worker:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 384Mi
+    limits:
+      memory: 768Mi
+
+# Celery beat scheduler. Exactly one replica: a second would double-fire every
+# periodic task.
+beat:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# `manage.py migrate`, run as a pre-install/pre-upgrade hook. Argo CD maps those
+# Helm hooks onto its own PreSync phase, so the schema is always current before
+# any new api pod starts.
+migrator:
+  enabled: true
+  backoffLimit: 6
+  resources:
+    requests:
+      cpu: 100m
+      memory: 384Mi
+    limits:
+      memory: 768Mi
+
+# Collaborative editing server (Hocuspocus over WebSocket).
+live:
+  replicaCount: 1
+  port: 3000
+  basePath: "/live"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# Main React app, served as static files by nginx.
+web:
+  replicaCount: 2
+  port: 3000
+  # nginx starts as root and drops its worker processes to the `nginx` user.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - SETUID
+        - SETGID
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# Public "spaces" app (server-rendered).
+space:
+  replicaCount: 1
+  port: 3000
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# God-mode admin app, served as static files by nginx.
+admin:
+  replicaCount: 1
+  port: 3000
+  # Same nginx privilege drop as the web app.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - SETUID
+        - SETGID
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# Caddy front door. The single entry point: it fans /spaces, /god-mode, /live,
+# /api, /auth and /static out to the components and serves everything else from
+# the web app.
+proxy:
+  replicaCount: 2
+  # Service port. TLS terminates ahead of the release, so this is plain HTTP.
+  port: 80
+  # Container port. Deliberately above 1024 so Caddy needs no NET_BIND_SERVICE
+  # capability and the drop-ALL security context holds.
+  containerPort: 8080
+  # Caddy only honours X-Forwarded-Proto/For from a trusted peer. Django marks a
+  # request secure from that header, so the ingress hop must be trusted or every
+  # request looks like plain HTTP and CSRF checks fail.
+  trustedProxies: "0.0.0.0/0"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# Cache and the live server's presence store.
+redis:
+  enabled: true
+  image:
+    repository: valkey/valkey
+    tag: "7.2.11-alpine"
+    pullPolicy: IfNotPresent
+  port: 6379
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClassName: "gp3"
+  # The image's entrypoint chowns /data and gosu's into the `valkey` user.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - CHOWN
+        - DAC_OVERRIDE
+        - FOWNER
+        - SETUID
+        - SETGID
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# Celery broker.
+rabbitmq:
+  enabled: true
+  image:
+    repository: rabbitmq
+    tag: "3.13.6-management-alpine"
+    pullPolicy: IfNotPresent
+  port: 5672
+  managementPort: 15672
+  username: "plane"
+  vhost: "plane"
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClassName: "gp3"
+  # The image's entrypoint writes the generated config, chowns
+  # /var/lib/rabbitmq and gosu's into the `rabbitmq` user.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - CHOWN
+        - DAC_OVERRIDE
+        - FOWNER
+        - SETUID
+        - SETGID
+  resources:
+    requests:
+      cpu: 100m
+      memory: 384Mi
+    limits:
+      memory: 768Mi
+
+# Set redis.enabled/rabbitmq.enabled to false to run against endpoints outside
+# the release. There are then two ways to supply them:
+#
+#   1. Through extraEnvFrom, as REDIS_URL and AMQP_URL on the secret. Leave the
+#      values below empty. This is the right choice for a managed cache or
+#      broker, whose URLs carry credentials (and are usually TLS -- rediss:// and
+#      amqps://, both of which Plane and the live server handle) and so belong in
+#      a secret rather than a ConfigMap.
+#   2. Here, for an endpoint that needs no credentials in its URL. The broker
+#      password still comes from the secret as RABBITMQ_PASSWORD, since Plane
+#      assembles the broker URL from the parts below plus that password.
+#
+# Setting neither, with the statefulsets disabled and nothing in extraEnvFrom,
+# leaves the components with no cache or broker to reach.
+externalRedis:
+  url: ""
+externalRabbitmq:
+  host: ""
+  port: "5672"

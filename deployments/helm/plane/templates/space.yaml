@@ -1,0 +1,81 @@
+{{- $name := include "plane.componentName" (dict "root" . "component" "space") -}}
+{{- /*
+  Public "spaces" app, server-rendered under /spaces. Like the other frontends
+  it is built with relative base URLs, so upstream's compose file gives it no
+  environment either.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: space
+spec:
+  replicas: {{ .Values.space.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "plane.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: space
+  template:
+    metadata:
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: space
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: space
+          image: {{ include "plane.image" (dict "root" $ "suffix" "space" "override" .Values.space.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.space.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.space.port | quote }}
+          startupProbe:
+            httpGet:
+              path: /spaces/
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /spaces/
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /spaces/
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.space.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: space
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.space.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "plane.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: space

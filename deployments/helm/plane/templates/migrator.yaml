@@ -1,0 +1,49 @@
+{{- if .Values.migrator.enabled }}
+{{- /*
+  Schema migrations. Runs as a Helm pre-install/pre-upgrade hook, which Argo CD
+  maps onto its own PreSync phase, so the database is always migrated before a
+  single new api, worker or beat pod starts.
+
+  The job is kept after it succeeds (deleted only when the next one is created)
+  so its logs stay available for the run that just happened.
+*/ -}}
+{{- $name := include "plane.componentName" (dict "root" . "component" "migrator") -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrator
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrator.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrator
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "plane.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrator
+          image: {{ include "plane.image" (dict "root" $ "suffix" "backend" "override" .Values.migrator.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["./bin/docker-entrypoint-migrator.sh"]
+          envFrom:
+            {{- include "plane.envFrom" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrator.resources | nindent 12 }}
+{{- end }}

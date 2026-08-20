@@ -312,8 +312,14 @@ USE_MINIO = int(os.environ.get("USE_MINIO", 0)) == 1
 
 STORAGES = {"staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"}}
 STORAGES["default"] = {"BACKEND": "plane.settings.storage.S3Storage"}
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "access-key")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "secret-key")
+# Use `or None` so an unset (or explicitly empty) variable falls through to
+# boto3's own credential chain -- an instance profile, or the web-identity
+# token an EKS service account is bound to -- rather than handing boto3 a
+# placeholder key it will send to S3 and get InvalidAccessKeyId back for. The
+# placeholders only ever fitted the bundled MinIO, which sets both explicitly
+# anyway; a real S3 deployment on a role has nothing to put here.
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") or None
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
 AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME", "uploads")
 AWS_REGION = os.environ.get("AWS_REGION", "")
 AWS_DEFAULT_ACL = "public-read"

@@ -1,0 +1,58 @@
+{{- $name := include "plane.componentName" (dict "root" . "component" "worker") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "plane.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "plane.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: {{ include "plane.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "plane.image" (dict "root" $ "suffix" "backend" "override" .Values.worker.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["./bin/docker-entrypoint-worker.sh"]
+          envFrom:
+            {{- include "plane.envFrom" . | nindent 12 }}
+          {{- /*
+            Celery has no HTTP surface; `celery inspect ping` round-trips
+            through the broker, which is the dependency actually worth
+            watching. The generous timeouts keep a busy worker from being
+            killed mid-task.
+          */}}
+          startupProbe:
+            exec:
+              command: ["bash", "-c", 'celery -A plane inspect ping -d "celery@$(hostname)"']
+            periodSeconds: 15
+            timeoutSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", 'celery -A plane inspect ping -d "celery@$(hostname)"']
+            periodSeconds: 60
+            timeoutSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
