@@ -1,11 +1,26 @@
 {{- $fullName := include "plane.fullname" . -}}
 {{- $storage := .Values.config.storage -}}
+{{- /*
+  A pre-install/pre-upgrade hook for the same reason as the service account: the
+  migrator hook reads this map through envFrom, and hooks run ahead of every
+  ordinary resource, so a map rendered as one would leave the job's pod stuck in
+  CreateContainerConfigError. The weight keeps it ahead of the migrator.
+
+  Being a hook takes it out of the Argo CD resource tree, so config drift no
+  longer shows up in a diff -- it is reapplied from the chart on every sync
+  instead. The deployments still carry a checksum of this template, so a change
+  here rolls the pods that consume it.
+*/ -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ $fullName }}-config
   labels:
     {{- include "plane.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
 data:
   DEBUG: {{ .Values.config.debug | quote }}
   GUNICORN_WORKERS: {{ .Values.config.gunicornWorkers | quote }}

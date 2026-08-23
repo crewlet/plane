@@ -5,6 +5,6 @@ description: >-
   worker and beat components behind the Caddy proxy, plus the in-cluster Valkey
   and RabbitMQ they depend on.
 type: application
-version: 0.1.0
+version: 0.1.1
 # Overridden by image.tag; the fork publishes a rolling `preview` tag.
 appVersion: "preview"
