@@ -36,7 +36,7 @@ spec:
           image: {{ include "plane.image" (dict "root" $ "suffix" "proxy" "override" .Values.proxy.image) | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml .Values.proxy.containerSecurityContext | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.proxy.containerPort }}

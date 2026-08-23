@@ -113,6 +113,9 @@ extraEnvFrom: []
 # chown the data dir and gosu into the service user) add back exactly the
 # capabilities that transition needs. Dropping ALL there would leave nginx unable
 # to start its workers and gosu unable to call setuid.
+#
+# The proxy overrides this set for an unrelated reason -- a capability its image
+# carries on the binary rather than one the process asks for. See proxy below.
 podSecurityContext: {}
 containerSecurityContext:
   allowPrivilegeEscalation: false
@@ -162,6 +165,20 @@ beat:
 migrator:
   enabled: true
   backoffLimit: 6
+  # Ceiling on one migration run. backoffLimit alone cannot bound this job:
+  # it counts failed pods, and the failure that hurts most -- a pod the
+  # controller is refused permission to create at all -- never produces one.
+  # Such a job stays Active forever, and because the install waits on the hook,
+  # so does the install: Argo CD sits in PreSync with no error to report.
+  #
+  # This deadline turns that into a job Kubernetes marks DeadlineExceeded, which
+  # fails the hook, fails the sync, and hands over to the caller's retry policy.
+  # It is a backstop, not a schedule -- generous enough that only a wedged run
+  # reaches it, since Kubernetes also applies it to a migration that is genuinely
+  # working, and killing one mid-flight only rolls back cleanly for the migrations
+  # Django runs in a transaction. Raise it for a large database; set it to null to
+  # go back to waiting indefinitely.
+  activeDeadlineSeconds: 1800
   resources:
     requests:
       cpu: 100m
@@ -192,6 +209,11 @@ web:
       drop:
         - ALL
       add:
+        # The master chowns /var/cache/nginx to the worker uid before it forks,
+        # and that chown is refused without CHOWN even though the process is
+        # root -- for a root process the kernel tests the capability, not the
+        # uid. nginx treats the failure as fatal and exits during startup.
+        - CHOWN
         - SETUID
         - SETGID
   resources:
@@ -223,6 +245,11 @@ admin:
       drop:
         - ALL
       add:
+        # The master chowns /var/cache/nginx to the worker uid before it forks,
+        # and that chown is refused without CHOWN even though the process is
+        # root -- for a root process the kernel tests the capability, not the
+        # uid. nginx treats the failure as fatal and exits during startup.
+        - CHOWN
         - SETUID
         - SETGID
   resources:
@@ -239,9 +266,22 @@ proxy:
   replicaCount: 2
   # Service port. TLS terminates ahead of the release, so this is plain HTTP.
   port: 80
-  # Container port. Deliberately above 1024 so Caddy needs no NET_BIND_SERVICE
-  # capability and the drop-ALL security context holds.
+  # Container port. Above 1024 so Caddy never has to bind a privileged port.
   containerPort: 8080
+  # NET_BIND_SERVICE is nonetheless required, which the port above cannot avoid:
+  # the upstream caddy image ships the binary with that capability set on the
+  # file itself, and the kernel refuses to exec a file whose capabilities are
+  # absent from the bounding set -- `exec /usr/bin/caddy: operation not
+  # permitted`, before Caddy runs a single line. What the process needs at
+  # runtime is beside the point; the check happens at exec. Removing the file
+  # capability from the image would be the alternative.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - NET_BIND_SERVICE
   # Caddy only honours X-Forwarded-Proto/For from a trusted peer. Django marks a
   # request secure from that header, so the ingress hop must be trusted or every
   # request looks like plain HTTP and CSRF checks fail.
